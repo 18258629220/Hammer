@@ -14,6 +14,7 @@ from .utils import OAFFORD_AFFORD_QUESTION_LIST, OAFFORD_AFFORD_ANSWER_LIST
 from .utils import OAFFORD_AFFORD_OBJ_ANSWER_LIST
 
 from .conversation import get_default_conv_template
+from .partfield_cache import cache_manifest, load_partfield_cache
 
 
 AFFORD_LABEL = [
@@ -51,6 +52,18 @@ SEEN = [
 ]
 
 
+def _prepare_partfield_cache(model_variant, directory):
+    if model_variant not in ("hammer", "partfield", "crag3d"):
+        raise ValueError(f"Unknown dataset model variant: {model_variant}")
+    if model_variant == "hammer":
+        return ""
+    if not directory:
+        raise ValueError(f"model_variant={model_variant} requires partfield_cache_dir")
+    directory = os.path.abspath(os.path.expanduser(directory))
+    cache_manifest(directory)
+    return directory
+
+
 def collate_fn(
     batch, tokenizer=None, processor=None, model_name="qwen_vl"
 ):
@@ -58,7 +71,7 @@ def collate_fn(
     Custom collate function for Qwen-VL model to process images once and handle multiple conversations efficiently.
 
     Args:
-        batch: List of tuples containing (image, point_list, afford_list, afford_index_list, conversation_list)
+        batch: Five-field HAMMER samples, optionally followed by a PartField cache dictionary.
         processor: Instance of Qwen2_5_VLProcessor or similar
         tokenizer: Optional tokenizer (defaults to processor.tokenizer)
         model_name: Name of the model (e.g., "qwen_vl")
@@ -68,6 +81,10 @@ def collate_fn(
     """
     tokenizer = tokenizer or processor.tokenizer
     model_name = model_name.lower()
+    sample_lengths = {len(sample) for sample in batch}
+    if sample_lengths not in ({5}, {6}):
+        raise ValueError("Each batch must contain only HAMMER 5-tuples or only cached 6-tuples")
+    has_partfield = sample_lengths == {6}
 
     image_list = []
     point_list = []
@@ -76,14 +93,31 @@ def collate_fn(
     offset_list = [0]
     cnt = 0
     inferences = []
+    feature_list, part_id_list, point_keys = [], [], []
+    feature_shape = None
 
-    for (
-        image,
-        point,
-        afford,
-        conversation,
-        inference,
-    ) in batch:
+    for sample in batch:
+        image, point, afford, conversation, inference = sample[:5]
+        if has_partfield:
+            cached = sample[5]
+            required = {"partfield_features", "partfield_part_ids", "point_key"}
+            if not isinstance(cached, dict) or not required.issubset(cached):
+                raise ValueError("Cached samples must contain PartField features, part IDs and point_key")
+            features, part_ids = cached["partfield_features"], cached["partfield_part_ids"]
+            if not isinstance(features, torch.Tensor) or not isinstance(part_ids, torch.Tensor):
+                raise ValueError("PartField feature and part ID fields must be tensors")
+            if (point.ndim != 2 or point.shape[0] != 3 or features.ndim != 2
+                    or features.shape[0] != point.shape[1] or features.shape[1] < 1
+                    or part_ids.shape != (point.shape[1],) or afford.shape[0] != point.shape[1]):
+                raise ValueError("Point, GT, PartField feature and part ID dimensions do not align")
+            if feature_shape is not None and tuple(features.shape) != feature_shape:
+                raise ValueError("PartField point count and feature dimension must agree within a batch")
+            if not isinstance(cached["point_key"], str) or not cached["point_key"]:
+                raise ValueError("Cached samples must have a nonempty point_key")
+            feature_shape = tuple(features.shape)
+            feature_list.append(features)
+            part_id_list.append(part_ids)
+            point_keys.append(cached["point_key"])
         conversation = [conversation]
         image_list.append(image)
         point_list.append(torch.from_numpy(point).float())
@@ -189,7 +223,7 @@ def collate_fn(
     else:
         raise NotImplementedError(f"Model {model_name} is not supported in this collate function.")
     
-    return {
+    result = {
         "input_ids": input_ids,
         "labels": targets,
         "attention_masks": attention_masks,
@@ -200,6 +234,13 @@ def collate_fn(
         "offset": torch.LongTensor(offset_list),
         "inference": inferences[0] if inferences else False,
     }
+    if has_partfield:
+        result.update(
+            partfield_features=torch.stack(feature_list, dim=0),
+            partfield_part_ids=torch.stack(part_id_list, dim=0),
+            point_key=point_keys,
+        )
+    return result
 
 
 class PIADAfford(Dataset):
@@ -212,6 +253,8 @@ class PIADAfford(Dataset):
         setting='Seen',
         model_name="qwen_vl",
         question_type='simple', # 'simple' or 'afford' or 'afford_obj'
+        model_variant='hammer',
+        partfield_cache_dir='',
     ):
         super().__init__()
         self.samples_per_epoch = samples_per_epoch
@@ -220,6 +263,8 @@ class PIADAfford(Dataset):
         self.setting = setting
         self.model_name = model_name.lower()
         self.question_type = question_type
+        self.model_variant = model_variant
+        self.partfield_cache_dir = _prepare_partfield_cache(model_variant, partfield_cache_dir)
         
         if setting == 'Seen':
             num_dict = {item: dict() for item in SEEN}
@@ -308,7 +353,9 @@ class PIADAfford(Dataset):
 
         point_file = self.point_files[idx]
         point, afford = self.extract_point_file(point_file)
+        raw_point = point
         point = pc_normalize(point)
+        cached = load_partfield_cache(self.partfield_cache_dir, raw_point, point) if self.partfield_cache_dir else None
         point = point.transpose()
 
         obj_name, afford_name = point_file.split('/')[-4], point_file.split('/')[-2]
@@ -327,7 +374,8 @@ class PIADAfford(Dataset):
         conversation = self.generate_cnversation(obj_name, afford_name)
         inference = False if self.split == 'train' else True
 
-        return image_vlm, point, afford, conversation, inference
+        sample = image_vlm, point, afford, conversation, inference
+        return sample + (cached,) if cached is not None else sample
 
     def extract_point_file(self, path):
         lines = np.load(path)
@@ -353,6 +401,8 @@ class PIADv1Afford(Dataset):
         setting='Seen',
         model_name="qwen_vl",
         question_type='simple', # 'simple' or 'afford' or 'afford_obj'
+        model_variant='hammer',
+        partfield_cache_dir='',
     ):
         super().__init__()
         self.samples_per_epoch = samples_per_epoch
@@ -361,6 +411,8 @@ class PIADv1Afford(Dataset):
         self.setting = setting
         self.model_name = model_name.lower()
         self.question_type = question_type
+        self.model_variant = model_variant
+        self.partfield_cache_dir = _prepare_partfield_cache(model_variant, partfield_cache_dir)
 
         self.afford_label = [
             'grasp', 'contain', 'lift', 'open', 'lay', 'sit', 'support', 'wrapgrasp', 
@@ -463,7 +515,9 @@ class PIADv1Afford(Dataset):
         idx = random.randint(0, len(self.point_files) - 1) if self.split == 'train' else idx
         point_file = self.point_files[idx]
         point, afford = self.extract_point_file(point_file)
+        raw_point = point
         point = pc_normalize(point)
+        cached = load_partfield_cache(self.partfield_cache_dir, raw_point, point) if self.partfield_cache_dir else None
         point = point.transpose()
 
         if self.split == 'train':
@@ -483,7 +537,8 @@ class PIADv1Afford(Dataset):
         conversation = self.generate_cnversation(obj_name, afford_name)
         inference = False if self.split == 'train' else True
 
-        return image_vlm, point, afford, conversation, inference
+        sample = image_vlm, point, afford, conversation, inference
+        return sample + (cached,) if cached is not None else sample
 
     def extract_point_file(self, path):
         if self.split == 'train':

@@ -1,0 +1,4 @@
+[submodule "third_party/PartField"]
+	path = third_party/PartField
+	url = https://github.com/nv-tlabs/PartField.git
+	ignore = untracked

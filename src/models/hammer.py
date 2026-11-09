@@ -16,6 +16,7 @@ from src.models.point_model.pointnet2 import (
     PointNetFeaturePropagation
 )
 from src.models.decoder.transformer import CrossAttnBlock
+from src.models.crag.partfield_adapter import PartFieldAdapter
     
 
 class SwapAxes(nn.Module):
@@ -187,15 +188,21 @@ class SegModel(nn.Module):
         point_embd_dim = kwargs.get("point_embd_dim", 512)
         point_N_p = kwargs.pop("point_N_p", 64)
         point_normal_channel = kwargs.pop("point_normal_channel", False)
-        self.point_backbone = PointBackbone(
-            emb_dim=point_embd_dim,
-            normal_channel=point_normal_channel,
-            additional_channel=additional_channel,
-            N_p=point_N_p,
-            latent_out_dim=kwargs["vlm_out_dim"]
-        )
-        for param in self.point_backbone.parameters():
-            param.requires_grad = True
+        if kwargs.get("model_variant", "hammer") == "partfield":
+            feature_dim = kwargs.get("partfield_feature_dim")
+            if not isinstance(feature_dim, int) or isinstance(feature_dim, bool) or feature_dim < 1:
+                raise ValueError("PartField feature_dim must be a positive integer from the cache manifest")
+            self.partfield_adapter = PartFieldAdapter(feature_dim, embedding_dim=point_embd_dim)
+        else:
+            self.point_backbone = PointBackbone(
+                emb_dim=point_embd_dim,
+                normal_channel=point_normal_channel,
+                additional_channel=additional_channel,
+                N_p=point_N_p,
+                latent_out_dim=kwargs["vlm_out_dim"]
+            )
+            for param in self.point_backbone.parameters():
+                param.requires_grad = True
 
         self.lift_to_3d = LiftTo3D(
             depth=4,
@@ -226,10 +233,11 @@ class Hammer(nn.Module):
     def __init__(self, config, **kwargs):
         super(Hammer, self).__init__()
         self.model_variant = kwargs.pop("model_variant", "hammer")
-        if self.model_variant != "hammer":
+        if self.model_variant not in ("hammer", "partfield"):
             raise NotImplementedError(
-                f"Model variant {self.model_variant!r} is not implemented at stage 1; refusing to use HAMMER as a fallback."
+                f"Model variant {self.model_variant!r} requires the CRIM/FGED stages; refusing to use another variant as a fallback."
             )
+        kwargs["model_variant"] = self.model_variant
         self.cont_token_idx = kwargs.pop("cont_token_idx")
         vlm_out_dim = kwargs["vlm_out_dim"]
         point_embd_dim = kwargs.get("point_embd_dim", 512)
@@ -258,7 +266,12 @@ class Hammer(nn.Module):
         self.mask_loss_weight = kwargs.pop("mask_loss_weight", 0)
 
     @torch.autocast(device_type='cuda', dtype=torch.float32)    
-    def get_point_embs(self, points, hidden_states):
+    def get_point_embs(self, points, hidden_states, partfield_features=None, partfield_part_ids=None):
+        if self.model_variant == "partfield":
+            if partfield_features is None or partfield_part_ids is None:
+                raise ValueError("PartField mode requires aligned partfield_features and partfield_part_ids")
+            encoded = self.seg_model.partfield_adapter(points, partfield_features, partfield_part_ids)
+            return encoded["multi_scale_features"]
         point_embedding = self.seg_model.point_backbone(points, hidden_states)
         
         return point_embedding
@@ -279,10 +292,16 @@ class Hammer(nn.Module):
         gt_affords: torch.FloatTensor,
         offset: torch.LongTensor,
         inference: bool = False,
+        partfield_features: torch.FloatTensor = None,
+        partfield_part_ids: torch.LongTensor = None,
         **kwargs
     ):
         B = points.shape[0]
         assert B == len(offset) - 1, "Batch size mismatch with offset length"
+        if self.model_variant == "partfield" and (
+            partfield_features is None or partfield_part_ids is None
+        ):
+            raise ValueError("PartField mode requires frozen feature/part-ID caches for every sample")
 
         output = self.vlm.forward(
             input_ids=input_ids,
@@ -319,7 +338,9 @@ class Hammer(nn.Module):
             pred_embeddings_list.append(pred_embeddings[start_i:end_i])
         pred_embeddings = torch.stack(pred_embeddings_list, dim=0)
 
-        point_embeddings = self.get_point_embs(points, last_hidden_state)
+        point_embeddings = self.get_point_embs(
+            points, last_hidden_state, partfield_features, partfield_part_ids
+        )
 
         cont = self.projection(pred_embeddings)
         cont = self.seg_model.lift_to_3d(cont, point_embeddings)
@@ -328,10 +349,16 @@ class Hammer(nn.Module):
         loss_ce = output.loss * self.ce_loss_weight
         loss_ca = loss_ca * self.mask_loss_weight
         total_loss = loss_ce + loss_ca
-        return {
+        result = {
             "loss": total_loss,
             "ce_loss": loss_ce,
             "ca_loss": loss_ca,
             "pred_afford": pred_afford
         }
+        if self.model_variant == "partfield":
+            result["adapter_shapes"] = [list(features.shape) for features in point_embeddings]
+            result["adapter_features_finite"] = torch.stack([
+                torch.isfinite(features).all() for features in point_embeddings
+            ]).all()
+        return result
 

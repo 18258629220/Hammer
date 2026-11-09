@@ -98,13 +98,14 @@ bash scripts/eval.sh
 
 ## CRAG-3D 分阶段实施
 
-实施规范见 `CRAG3D.md`。当前交付阶段 1 的训练入口扩展，保留
+实施规范见 `CRAG3D.md`。保留阶段 1 的训练入口扩展，以及
 `--model_variant hammer`（默认）的原模型、CE/CA 损失、DeepSpeed 配置和评测指标。
 HAMMER 基线固定为 `e8aa2e6f5c705d1e58f129e9426870877be03011`，可从该提交恢复原版。
-阶段 1 的真实单批前向/反向已通过，阶段 2 及后续算法尚未实现；
+阶段 1 的真实单批前向/反向已通过。阶段 2 已完成全量离线缓存和模型接入，
+真实缓存的训练入口前向/反向检查已通过；后续 CRIM/FGED 尚未实现。
 选择 `crag3d` 训练会明确报错，避免误把 HAMMER 当作 CRAG-3D 运行。
 
-原 shell 支持 `-m hammer|crag3d`、`-c PARTFIELD_CACHE_DIR`，以及 `--` 后透传
+原 shell 支持 `-m hammer|partfield|crag3d`、`-c PARTFIELD_CACHE_DIR`，以及 `--` 后透传
 `train.py` 参数。新增参数包括 `--role_loss_weight`、`--graph_loss_weight`、
 `--cf_loss_weight` 和 `--energy_steps`；当前仅记录这些算法参数。
 shell 仍使用四 GPU、全局 batch 64、30 epochs 的默认规格，并检查 batch 整除关系。
@@ -149,6 +150,98 @@ rank 0 总损失为 7.4473619461（CE 5.1187548637，CA 2.3286068439），四个
 协议差异：原 `train.py` 使用 `split="test"` 做每轮验证并按 aIoU 选优，
 与规范中“不要拿 test 做模型选择”存在冲突。当前保留原入口行为，
 并在日志和元数据中明确记录，未更改数据划分或指标定义。
+
+### 阶段 2：冻结 PartField 缓存与简单头消融
+
+`-m partfield` 是独立的 PartField backbone 消融：保留单个 `[CONT]`、Qwen/LoRA、
+原 LiftTo3D 和 AffordDecoder，使用 PartFieldAdapter 取代 PointBackbone。
+adapter 对冻结特征进行可训练投影、局部 kNN 汇聚与簇上下文融合，保持完整 N 点输出，
+并生成 `[64,128,512,N]` 四个尺度；它不在训练时加载 PartField 推理模型。
+投影、MLP、LayerNorm 和几何汇聚使用 FP32 运算，梯度保留到 DeepSpeed 的 BF16 参数。
+该模式与尚未实现的 `crag3d` 明确区分，`-m hammer` 继续运行原版路径。
+训练集和评估集中的任一样本缺缓存、坐标不齐或权重版本不一致都会报错。
+
+PartField [官方代码](https://github.com/nv-tlabs/PartField)通过子模块固定在
+`373025dbd283bb44cc4a6dc78c99994dbc91de32`。使用[官方 Objaverse checkpoint](https://huggingface.co/mikaelaangel/partfield-ckpt/blob/main/model_objaverse.ckpt)，
+SHA256 为 `463efc8a3afd3913142aa025e0125c00f16ef452b8de6a132ebe32bbe7877ee4`；
+提取入口检查官方 commit、源文件状态和 checkpoint 哈希。
+提取器直接复用官方 `TriPlanePC2Encoder`、`TriplaneTransformer` 和
+`sample_triplane_feat`，分别严格加载两个完整特征组件，显式排除未使用的 SDF/辅助头。
+每个进程绑定占用检查通过的 GPU UUID，批量处理相同点数的 XYZ，保留查询点索引。
+
+当前主机复用已有 `hammer` 环境的 PyTorch `2.5.0+cu118` 和
+`torch_scatter==2.1.2+pt25cu118`，通过独立 `.venv/partfield` 使用这些已安装依赖，
+仅在该虚拟环境中补充 `boto3==1.43.126`、`loguru==0.7.3`，不修改 HAMMER 训练环境。
+这与官方推荐的 PyTorch 2.4/CUDA 12.4 环境不同，不能视为相同环境的复现。
+
+```bash
+# 在项目根目录执行。子模块和下载入口均使用官方来源。
+git submodule update --init third_party/PartField
+/home/hzl/miniconda3/envs/hammer/bin/python -m venv --system-site-packages .venv/partfield
+.venv/partfield/bin/python -m pip install boto3==1.43.126 loguru==0.7.3
+
+# 使用已有 hammer Python 的 Hugging Face API，避免依赖 hf 命令的 shebang。
+/home/hzl/miniconda3/envs/hammer/bin/python - <<'PY'
+from huggingface_hub import hf_hub_download
+hf_hub_download(
+    repo_id="mikaelaangel/partfield-ckpt",
+    filename="model_objaverse.ckpt",
+    local_dir="third_party/PartField/model",
+)
+PY
+
+# 可单独盘点全部官方点云清单；不加载模型，写 inventory_preview.json。
+.venv/partfield/bin/python tools/extract_partfield.py --inventory_only
+
+# 每次运行前检查占用。只有 GPU 0–3 均空闲时才使用以下设备参数。
+nvidia-smi
+.venv/partfield/bin/python tools/extract_partfield.py \
+  --devices 0,1,2,3 --batch_size 8 --cpu_threads 2
+
+# 如需明确的部分提取，可增加 --limit；manifest 会保留未完成状态。
+# .venv/partfield/bin/python tools/extract_partfield.py --devices 0 --limit 8
+```
+
+当前盘点为 142,074 条 split 清单记录、137,587 个实际文件路径、31,223 份唯一 XYZ。
+缓存身份仅使用原始坐标，不使用 affordance 标签、类别、数据划分或标签文件哈希。
+相同点云在不同 affordance 文件中的特征可复用；训练和评估仍沿用各自官方清单。
+`inventory_preview.json`、正式 inventory、`manifest.json` 和逐点缓存均保存在
+`data/partfield_cache/`，这些文件与下载权重均不提交到 Git。
+
+提取时将原始 XYZ 转成 float32，按坐标排序后计算稳定 SHA256，再调用 HAMMER 的
+同一个 `pc_normalize()`。PartField 所需的 bbox 仿射变换被显式保存，查询结果按原点
+索引对应，不依赖切片猜测点序；fp16 查询坐标逆变换的几何误差阈值为 `1e-3`。
+训练读取缓存时使用逆排序恢复当前点序，核对坐标的绝对误差阈值为 `1e-5`。
+缓存保留冻结点特征、点坐标、簇 ID、来源几何身份、模型哈希与官方代码版本。
+簇由冻结特征的稳定 KMeans 得到，默认最多 16 簇，显式固定 `seed=0`、`n_init=1`、
+`max_iter=100`。本配置直接聚类原始 448 维特征；官方聚类脚本会先做 L2 归一化，
+此处的原始特征聚类作为明确的实现配置保留。
+簇 ID 仅表示当前 shape 内的部件，不被解释为座面、扶手等人工语义类别。
+
+默认重复执行提取命令会严格验证并复用已有缓存；不兼容的权重或提取配置会明确报错，
+不会静默覆盖。先确认 GPU 0–3 空闲，再通过原训练 shell 执行阶段 2 的入口级
+单批前向/反向检查：
+
+```bash
+PYTHON_BIN=/home/hzl/miniconda3/envs/hammer/bin/python \
+  bash scripts/train.sh -d PIADv1 -p Seen -m partfield \
+  -c "$PWD/data/partfield_cache" -g 4 -b 64 -n stage2_partfield_smoke -s \
+  -- --workers 0 --seed 3407
+```
+
+2026-11-09 实际交付：31,223 份逐点缓存全部生成，占约 55 GB；
+`manifest.json` 标记 `complete=true`，覆盖五种划分及实际存在的验证清单，
+并已核对全部 inventory key 与缓存文件一一对应。
+PIADv2 Seen 的实际训练清单为 36,190 条；原 shell 仍按 37,120 设置每轮采样步数，
+本阶段保持此行为和所有官方清单不变。
+
+实际检查运行 `PIADv1_Seen_afford_obj_crag_stage2_partfield_verified` 通过。
+四尺度尺寸为 `[1,64,512]`、`[1,128,512]`、`[1,512,512]`、`[1,2048,512]`，
+特征均为有限数值，预测形状为 `[1,2048,1]`；rank 0 总损失为 7.5574712753
+（CE 5.1187548637，CA 2.4387161732）。四个进程完成反向并正常退出，GPU 0–3 已释放。
+实验的 `smoke_result.json` 记录尺寸、有限值标记和源码哈希；当前源码与验证快照哈希一致。
+本阶段未执行 optimizer step、完整训练、checkpoint 保存或独立指标评估。
+按用户要求在阶段 2 提交后停止，等待验收指令再进入阶段 3。
 
 ## :books: License
 This repository is released under the [MIT license](LICENSE).

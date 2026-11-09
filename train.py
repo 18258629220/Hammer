@@ -70,7 +70,7 @@ def parse_args(args):
     parser.add_argument("--lr", default=0.0005, type=float)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--mask_loss_weight", default=2.0, type=float)
-    parser.add_argument("--model_variant", default="hammer", choices=["hammer", "crag3d"])
+    parser.add_argument("--model_variant", default="hammer", choices=["hammer", "partfield", "crag3d"])
     parser.add_argument("--partfield_cache_dir", default="", type=str)
     parser.add_argument("--role_loss_weight", default=1.0, type=float)
     parser.add_argument("--graph_loss_weight", default=0.1, type=float)
@@ -108,6 +108,8 @@ def parse_args(args):
     args.log_base_dir = str(Path(args.log_base_dir).expanduser().resolve())
     if args.partfield_cache_dir:
         args.partfield_cache_dir = str(Path(args.partfield_cache_dir).expanduser().resolve())
+    if args.model_variant == "partfield" and not args.partfield_cache_dir:
+        parser.error("--model_variant partfield requires --partfield_cache_dir")
     return args
 
 
@@ -115,6 +117,17 @@ def main(args):
     args = parse_args(args)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
     metadata = collect_provenance(args, Path(__file__).resolve().parent)
+    if args.model_variant == "partfield":
+        from src.utils.partfield_cache import cache_manifest
+        manifest = cache_manifest(args.partfield_cache_dir)
+        feature_dim = manifest.get("feature_dim")
+        if not isinstance(feature_dim, int) or isinstance(feature_dim, bool) or feature_dim < 1:
+            raise ValueError("PartField manifest must record a positive integer feature_dim")
+        args.partfield_feature_dim = feature_dim
+        metadata["partfield"] = {
+            name: manifest.get(name) for name in
+            ("model_sha", "partfield_commit", "feature_dim", "coordinate_system", "version")
+        }
     metadata["arguments"] = vars(args).copy()
     if args.local_rank == 0:
         write_provenance(Path(args.log_dir) / "provenance.json", metadata)
@@ -123,7 +136,8 @@ def main(args):
         return
     if args.model_variant == "crag3d":
         raise NotImplementedError(
-            "CRAG-3D is not implemented at stage 1. Complete the PartField/CRIM/FGED stages before training; no HAMMER fallback is allowed."
+            "CRAG-3D requires the CRIM/FGED stages before training; no fallback is allowed. "
+            "The explicit partfield variant is the single-token/simple-head ablation."
         )
 
     import torch
@@ -214,6 +228,7 @@ def main(args):
         "point_embd_dim": 512,
         "point_N_p": 64,
         "model_variant": args.model_variant,
+        "partfield_feature_dim": getattr(args, "partfield_feature_dim", None),
     }
 
     config = transformers.AutoConfig.from_pretrained(args.version)
@@ -257,7 +272,7 @@ def main(args):
             [
                 x in n
                 for x in [
-                    "projection", "point_backbone", "lift_to_3d", "afford_decoder"
+                    "projection", "point_backbone", "lift_to_3d", "afford_decoder", "partfield_adapter"
                 ]
             ]
         ):
@@ -287,6 +302,8 @@ def main(args):
         setting=args.setting,
         model_name="qwen_vl",
         question_type=args.question_type,
+        model_variant=args.model_variant,
+        partfield_cache_dir=args.partfield_cache_dir,
     )
 
     val_dataset = DatasetClass(
@@ -296,6 +313,8 @@ def main(args):
         setting=args.setting,
         model_name="qwen_vl",
         question_type=args.question_type,
+        model_variant=args.model_variant,
+        partfield_cache_dir=args.partfield_cache_dir,
     )
     if args.local_rank == 0:
         logger.info(f"Training with {len(train_dataset)} examples.")
@@ -425,6 +444,8 @@ def main(args):
                 raise RuntimeError(f"Non-finite values in {name}")
         if output_dict["pred_afford"].shape != input_dict["gt_affords"].shape:
             raise RuntimeError("Prediction and GT point dimensions do not match")
+        if "adapter_features_finite" in output_dict and not output_dict["adapter_features_finite"].item():
+            raise RuntimeError("Non-finite features in the PartField adapter")
         model_engine.backward(output_dict["loss"])
         if torch.distributed.is_initialized():
             torch.distributed.barrier(device_ids=[args.local_rank])
@@ -444,9 +465,16 @@ def main(args):
                 "backward_completed": True,
                 "optimizer_step_performed": False,
                 "checkpoint_saved": False,
+                "adapter_shapes": output_dict.get("adapter_shapes"),
+                "adapter_features_finite": (
+                    bool(output_dict["adapter_features_finite"].item())
+                    if "adapter_features_finite" in output_dict else None
+                ),
             })
             logger.info("Single-batch forward/backward passed: %s", loss_values)
             logger.info("pred_afford shape: %s", tuple(output_dict["pred_afford"].shape))
+            if "adapter_shapes" in output_dict:
+                logger.info("PartField adapter scales: %s", output_dict["adapter_shapes"])
             writer.close()
             wandb.finish()
         if torch.distributed.is_initialized():

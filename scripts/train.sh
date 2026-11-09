@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Usage: bash scripts/train.sh -d PIADv1 -p Seen -g 4 -b 64 -l 0.0001 -e 30 -n exp1 [-m hammer|crag3d] [-c CACHE] [-P|-s] [-- train.py args]
+# Usage: bash scripts/train.sh -d PIADv1 -p Seen -g 4 -b 64 -l 0.0001 -e 30 -n exp1 [-m hammer|partfield|crag3d] [-c CACHE] [-P|-s] [-- train.py args]
 
 # Set the used cuda path; maybe unnecessary
 export PATH=$HOME/local/cuda-11.8/bin:$PATH
@@ -63,7 +63,7 @@ while getopts ":d:p:g:b:l:e:n:m:c:Psh" opt; do
       SMOKE_CHECK=1
       ;;
     h)
-      echo "Usage: $0 -d DATASET -p SETTING -g GPUS -b GLOBAL_BATCH -l LR -e EPOCHS -n NAME [-m hammer|crag3d] [-c CACHE] [-P|-s] [-- train.py args]"
+      echo "Usage: $0 -d DATASET -p SETTING -g GPUS -b GLOBAL_BATCH -l LR -e EPOCHS -n NAME [-m hammer|partfield|crag3d] [-c CACHE] [-P|-s] [-- train.py args]"
       echo "-P: source/data preflight only; -s: one real training batch forward/backward"
       exit 0
       ;;
@@ -90,7 +90,7 @@ if (( GLOBAL_BATCH_SIZE % (BATCH_SIZE_PER_DEVICE * NUM_DEVICES) != 0 )); then
     exit 2
 fi
 case "$MODEL_VARIANT" in
-    hammer|crag3d) ;;
+    hammer|partfield|crag3d) ;;
     *) echo "Unknown model variant: $MODEL_VARIANT" >&2; exit 2 ;;
 esac
 case "$DATASET/$SETTING" in
