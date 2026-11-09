@@ -1,33 +1,15 @@
 import os
 import sys
-import wandb
 import shutil
 import argparse
+import json
+from pathlib import Path
 from functools import partial
 
 import random
-import numpy as np
 from datetime import datetime
 
-import torch
-# Set TORCH_CUDA_ARCH_LIST before importing torch to avoid compilation warnings
-# This should match your GPU architecture (8.9 for RTX 4090)
-# More available in: https://developer.nvidia.com/cuda-gpus
-if 'TORCH_CUDA_ARCH_LIST' not in os.environ:
-    if torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability()
-        os.environ['TORCH_CUDA_ARCH_LIST'] = f"{major}.{minor}"
-
-import deepspeed
-import transformers
-from peft import LoraConfig, get_peft_model
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-
-from tools.trainer import train, validate
-from src.models.hammer import Hammer
-from src.utils.logger import get_root_logger
-from src.utils.afford_dataset import PIADv1Afford, PIADAfford, collate_fn
+from src.utils.experiment import collect_provenance, write_provenance
 
 
 def get_random_seed():
@@ -40,6 +22,9 @@ def get_random_seed():
 
 
 def set_seed(seed=None):
+    import numpy as np
+    import torch
+
     if seed is None:
         seed = get_random_seed()
     random.seed(seed)
@@ -85,6 +70,12 @@ def parse_args(args):
     parser.add_argument("--lr", default=0.0005, type=float)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--mask_loss_weight", default=2.0, type=float)
+    parser.add_argument("--model_variant", default="hammer", choices=["hammer", "crag3d"])
+    parser.add_argument("--partfield_cache_dir", default="", type=str)
+    parser.add_argument("--role_loss_weight", default=1.0, type=float)
+    parser.add_argument("--graph_loss_weight", default=0.1, type=float)
+    parser.add_argument("--cf_loss_weight", default=0.0, type=float)
+    parser.add_argument("--energy_steps", default=5, type=int)
     parser.add_argument("--lora_alpha", default=32, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
     parser.add_argument("--lora_target_modules", default="q_proj, v_proj", type=str)
@@ -99,13 +90,73 @@ def parse_args(args):
     parser.add_argument("--start_epoch", default=0, type=int, help="Starting epoch (overridden if resuming)")
     parser.add_argument("--auto_resume", action="store_true", default=False)
     parser.add_argument("--debug", action="store_true", default=False)
-    return parser.parse_args(args)
+    parser.add_argument("--preflight", action="store_true", help="Record source/data provenance without loading models or starting training")
+    parser.add_argument("--smoke_check", action="store_true", help="Run one real training batch forward/backward, then exit without saving a checkpoint")
+    args = parser.parse_args(args)
+    if args.dataset == "PIADv1" and args.setting not in ("Seen", "Unseen"):
+        parser.error("PIADv1 only supports Seen or Unseen")
+    if args.dataset == "PIADv2" and args.setting == "Unseen":
+        parser.error("PIADv2 uses Unseen_obj or Unseen_afford")
+    for name in ("epochs", "steps_per_epoch", "batch_size", "val_batch_size", "grad_accumulation_steps", "energy_steps"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name} must be positive")
+    for name in ("role_loss_weight", "graph_loss_weight", "cf_loss_weight"):
+        value = getattr(args, name)
+        if not 0 <= value < float("inf"):
+            parser.error(f"--{name} must be finite and nonnegative")
+    args.dataset_dir = str(Path(args.dataset_dir).expanduser().resolve())
+    args.log_base_dir = str(Path(args.log_base_dir).expanduser().resolve())
+    if args.partfield_cache_dir:
+        args.partfield_cache_dir = str(Path(args.partfield_cache_dir).expanduser().resolve())
+    return args
 
 
 def main(args):
     args = parse_args(args)
-    seed = set_seed(args.seed)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
+    metadata = collect_provenance(args, Path(__file__).resolve().parent)
+    metadata["arguments"] = vars(args).copy()
+    if args.local_rank == 0:
+        write_provenance(Path(args.log_dir) / "provenance.json", metadata)
+    if args.preflight:
+        print(json.dumps(metadata, ensure_ascii=False, indent=2))
+        return
+    if args.model_variant == "crag3d":
+        raise NotImplementedError(
+            "CRAG-3D is not implemented at stage 1. Complete the PartField/CRIM/FGED stages before training; no HAMMER fallback is allowed."
+        )
+
+    import torch
+    metadata["runtime"] = {
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_count": torch.cuda.device_count(),
+    }
+    if args.local_rank == 0:
+        write_provenance(Path(args.log_dir) / "provenance.json", metadata)
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "HAMMER training and --smoke_check require a working CUDA device; "
+            "torch.cuda.is_available() is False. Check the NVIDIA driver/device access. "
+            f"Source and data provenance was recorded in {args.log_dir}/provenance.json."
+        )
+    if 'TORCH_CUDA_ARCH_LIST' not in os.environ:
+        major, minor = torch.cuda.get_device_capability(args.local_rank)
+        os.environ['TORCH_CUDA_ARCH_LIST'] = f"{major}.{minor}"
+
+    import wandb
+    import deepspeed
+    import transformers
+    from peft import LoraConfig, get_peft_model
+    from torch.utils.data import DataLoader
+    from torch.utils.tensorboard import SummaryWriter
+    from tools.trainer import train, validate
+    from src.models.hammer import Hammer
+    from src.utils.logger import get_root_logger
+    from src.utils.afford_dataset import PIADv1Afford, PIADAfford, collate_fn
+    from src.utils.utils import dict_to_cuda
+
+    seed = set_seed(args.seed)
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
@@ -114,6 +165,8 @@ def main(args):
         logger.info(f"Logging to {log_file}")
         logger.info(f"Training arguments: {args}")
         logger.info(f"Using seed: {seed}")
+        logger.info(f"Model variant: {args.model_variant}; source SHA256: {metadata['source_sha256']}")
+        logger.info("Validation split is test, following the original HAMMER entry point; see provenance.json for the protocol discrepancy.")
 
         if args.debug:
             wandb.init(mode="disabled")  # Disable wandb in debug mode
@@ -160,6 +213,7 @@ def main(args):
         "attention": args.attention,
         "point_embd_dim": 512,
         "point_N_p": 64,
+        "model_variant": args.model_variant,
     }
 
     config = transformers.AutoConfig.from_pretrained(args.version)
@@ -178,7 +232,7 @@ def main(args):
 
     if args.lora_r > 0:
         # LoRA target modules [q_proj, v_proj]
-        lora_target_modules = args.lora_target_modules.split(",")
+        lora_target_modules = [name.strip() for name in args.lora_target_modules.split(",") if name.strip()]
         if args.local_rank == 0:
             logger.info(f"Applying LoRA with r={args.lora_r}, alpha={args.lora_alpha}")
         lora_config = LoraConfig(
@@ -353,6 +407,29 @@ def main(args):
     )
     
     train_iter = iter(train_loader)
+    if args.smoke_check:
+        model_engine.train()
+        input_dict = dict_to_cuda(next(train_iter))
+        with torch.autocast(device_type="cuda", dtype=torch_dtype, enabled=torch_dtype != torch.float32):
+            output_dict = model_engine(**input_dict)
+        required = {"loss", "ce_loss", "ca_loss", "pred_afford"}
+        missing = required.difference(output_dict)
+        if missing:
+            raise RuntimeError(f"Training output is missing keys: {sorted(missing)}")
+        for name in required:
+            if not torch.isfinite(output_dict[name]).all():
+                raise RuntimeError(f"Non-finite values in {name}")
+        if output_dict["pred_afford"].shape != input_dict["gt_affords"].shape:
+            raise RuntimeError("Prediction and GT point dimensions do not match")
+        model_engine.backward(output_dict["loss"])
+        if args.local_rank == 0:
+            logger.info("Single-batch forward/backward passed: %s", {
+                name: output_dict[name].detach().item() for name in ("loss", "ce_loss", "ca_loss")
+            })
+            logger.info("pred_afford shape: %s", tuple(output_dict["pred_afford"].shape))
+            writer.close()
+            wandb.finish()
+        return
     best_score = 0.0
     best_model = None
 

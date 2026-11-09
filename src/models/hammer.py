@@ -225,6 +225,11 @@ class SegModel(nn.Module):
 class Hammer(nn.Module):
     def __init__(self, config, **kwargs):
         super(Hammer, self).__init__()
+        self.model_variant = kwargs.pop("model_variant", "hammer")
+        if self.model_variant != "hammer":
+            raise NotImplementedError(
+                f"Model variant {self.model_variant!r} is not implemented at stage 1; refusing to use HAMMER as a fallback."
+            )
         self.cont_token_idx = kwargs.pop("cont_token_idx")
         vlm_out_dim = kwargs["vlm_out_dim"]
         point_embd_dim = kwargs.get("point_embd_dim", 512)

@@ -96,6 +96,47 @@ bash scripts/train.sh -d PIADv1 -p Seen -g 4 -b 64 -l 0.0001 -e 30 -n exp1
 bash scripts/eval.sh
 ```
 
+## CRAG-3D 分阶段实施
+
+实施规范见 `CRAG3D.md`。当前交付阶段 1 的训练入口扩展，保留
+`--model_variant hammer`（默认）的原模型、CE/CA 损失、DeepSpeed 配置和评测指标。
+HAMMER 基线固定为 `e8aa2e6f5c705d1e58f129e9426870877be03011`，可从该提交恢复原版。
+阶段 1 的真实单批前向/反向尚未通过，阶段 2 及后续算法尚未实现；
+选择 `crag3d` 训练会明确报错，避免误把 HAMMER 当作 CRAG-3D 运行。
+
+原 shell 支持 `-m hammer|crag3d`、`-c PARTFIELD_CACHE_DIR`，以及 `--` 后透传
+`train.py` 参数。新增参数包括 `--role_loss_weight`、`--graph_loss_weight`、
+`--cf_loss_weight` 和 `--energy_steps`；当前仅记录这些算法参数。
+shell 仍使用四 GPU、全局 batch 64、30 epochs 的默认规格，并检查 batch 整除关系。
+LoRA 目标名称会去除首尾空格，确保默认 `q_proj, v_proj` 均能匹配。
+
+```bash
+# 无需 GPU 或模型加载，记录源码及 PIADv1/v2 全部已有数据清单的 SHA256。
+bash scripts/train.sh -d PIADv1 -p Seen -n stage1_preflight -P
+
+# 在可用 CUDA 环境执行一次真实 batch 的前向/反向；不启动完整训练或保存 checkpoint。
+conda activate hammer
+bash scripts/train.sh -d PIADv1 -p Seen -g 1 -b 1 -n stage1_smoke -s
+
+# 也可显式选用已有 Python；预检和 DeepSpeed 启动器使用同一解释器。
+PYTHON_BIN=/path/to/hammer/bin/python bash scripts/train.sh -d PIADv1 -p Seen -n stage1_check -s
+```
+
+每次启动使用新的 `-n` 名称，避免覆盖已有 `exp/<experiment>/code` 源码快照。
+数据与缓存路径会解析为绝对路径；运行时从实际快照导入 `src` 和 `tools`。
+`exp/<experiment>/provenance.json` 记录基线/当前 Git commit、源码逐文件哈希、
+数据清单哈希及行数、模型模式、参数和路径；模型启动时另记录 CUDA 可用性。
+恢复现有训练时使用新实验名称，并在 `--` 后传入 `--resume /absolute/checkpoint/path`。
+
+2026-11-09 的阶段 1 检查：Python/Bash 语法和原 shell 的 `-P` 预检通过，
+记录了五种 PIAD 划分的 24 份清单；`-s` 已由原 shell 进入快照训练入口，
+但 `hammer` 环境的 CUDA 设备数为 0，因驱动/设备不可用停止，未完成 DataLoader/模型前向。
+恢复 GPU 可用性后须先通过该检查，再进入 PartField 缓存阶段。
+
+协议差异：原 `train.py` 使用 `split="test"` 做每轮验证并按 aIoU 选优，
+与规范中“不要拿 test 做模型选择”存在冲突。当前保留原入口行为，
+并在日志和元数据中明确记录，未更改数据划分或指标定义。
+
 ## :books: License
 This repository is released under the [MIT license](LICENSE).
 
