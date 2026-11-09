@@ -406,6 +406,10 @@ def main(args):
         ),
     )
     
+    if args.smoke_check:
+        # DeepSpeed otherwise starts its own workers regardless of --workers.
+        # A single-batch check exits early, so avoid leaving prefetched workers alive.
+        train_loader.num_local_io_workers = 0
     train_iter = iter(train_loader)
     if args.smoke_check:
         model_engine.train()
@@ -422,13 +426,31 @@ def main(args):
         if output_dict["pred_afford"].shape != input_dict["gt_affords"].shape:
             raise RuntimeError("Prediction and GT point dimensions do not match")
         model_engine.backward(output_dict["loss"])
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier(device_ids=[args.local_rank])
         if args.local_rank == 0:
-            logger.info("Single-batch forward/backward passed: %s", {
+            loss_values = {
                 name: output_dict[name].detach().item() for name in ("loss", "ce_loss", "ca_loss")
+            }
+            write_provenance(Path(args.log_dir) / "smoke_result.json", {
+                "model_variant": args.model_variant,
+                "git_commit": metadata["git"]["head"],
+                "source_sha256": metadata["source_sha256"],
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "world_size": world_size,
+                "local_batch_size": args.batch_size,
+                "pred_afford_shape": list(output_dict["pred_afford"].shape),
+                "rank0_losses": loss_values,
+                "backward_completed": True,
+                "optimizer_step_performed": False,
+                "checkpoint_saved": False,
             })
+            logger.info("Single-batch forward/backward passed: %s", loss_values)
             logger.info("pred_afford shape: %s", tuple(output_dict["pred_afford"].shape))
             writer.close()
             wandb.finish()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
         return
     best_score = 0.0
     best_model = None

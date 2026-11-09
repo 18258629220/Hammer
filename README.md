@@ -101,7 +101,7 @@ bash scripts/eval.sh
 实施规范见 `CRAG3D.md`。当前交付阶段 1 的训练入口扩展，保留
 `--model_variant hammer`（默认）的原模型、CE/CA 损失、DeepSpeed 配置和评测指标。
 HAMMER 基线固定为 `e8aa2e6f5c705d1e58f129e9426870877be03011`，可从该提交恢复原版。
-阶段 1 的真实单批前向/反向尚未通过，阶段 2 及后续算法尚未实现；
+阶段 1 的真实单批前向/反向已通过，阶段 2 及后续算法尚未实现；
 选择 `crag3d` 训练会明确报错，避免误把 HAMMER 当作 CRAG-3D 运行。
 
 原 shell 支持 `-m hammer|crag3d`、`-c PARTFIELD_CACHE_DIR`，以及 `--` 后透传
@@ -114,9 +114,11 @@ LoRA 目标名称会去除首尾空格，确保默认 `q_proj, v_proj` 均能匹
 # 无需 GPU 或模型加载，记录源码及 PIADv1/v2 全部已有数据清单的 SHA256。
 bash scripts/train.sh -d PIADv1 -p Seen -n stage1_preflight -P
 
-# 在可用 CUDA 环境执行一次真实 batch 的前向/反向；不启动完整训练或保存 checkpoint。
+# 先确认 GPU 0–3 空闲，再按原四卡规格执行一次真实 batch 的前向/反向。
+# 不启动完整训练或保存 checkpoint。
+nvidia-smi
 conda activate hammer
-bash scripts/train.sh -d PIADv1 -p Seen -g 1 -b 1 -n stage1_smoke -s
+bash scripts/train.sh -d PIADv1 -p Seen -g 4 -b 64 -n stage1_smoke -s -- --workers 0 --seed 3407
 
 # 也可显式选用已有 Python；预检和 DeepSpeed 启动器使用同一解释器。
 PYTHON_BIN=/path/to/hammer/bin/python bash scripts/train.sh -d PIADv1 -p Seen -n stage1_check -s
@@ -128,10 +130,21 @@ PYTHON_BIN=/path/to/hammer/bin/python bash scripts/train.sh -d PIADv1 -p Seen -n
 数据清单哈希及行数、模型模式、参数和路径；模型启动时另记录 CUDA 可用性。
 恢复现有训练时使用新实验名称，并在 `--` 后传入 `--resume /absolute/checkpoint/path`。
 
+`-s` 检查使用真实 Dataset、collate、Qwen、LoRA 和 DeepSpeed ZeRO-2，读取一批后
+核对四个兼容输出键、有限数值及预测/GT 形状，并执行反向。所有 rank 完成后，
+rank 0 写入 `smoke_result.json`，记录损失、预测形状、GPU 映射、源码哈希及反向状态。
+该模式使用零个训练 DataLoader worker，并在退出前销毁分布式进程组；不执行
+optimizer step、不保存权重。正式训练仍保留原 DataLoader 和训练主循环。
+
 2026-11-09 的阶段 1 检查：Python/Bash 语法和原 shell 的 `-P` 预检通过，
-记录了五种 PIAD 划分的 24 份清单；`-s` 已由原 shell 进入快照训练入口，
-但 `hammer` 环境的 CUDA 设备数为 0，因驱动/设备不可用停止，未完成 DataLoader/模型前向。
-恢复 GPU 可用性后须先通过该检查，再进入 PartField 缓存阶段。
+记录了五种 PIAD 划分的 24 份清单。最初的 CUDA 不可用来自沙箱设备访问限制；
+沙箱外同一 `hammer` 环境能识别 8 张 GPU。重新检查占用后，选用空闲的 GPU 0–3
+（4090），未使用正在运行其他任务的 GPU 4–6。原四卡、全局 batch 64、BF16、
+LoRA r=16/alpha=32、CE/CA 权重 1/2 的真实单批前向/反向通过。
+最终运行 `PIADv1_Seen_afford_obj_crag_stage1_verified` 的预测形状为 `[1,2048,1]`，
+rank 0 总损失为 7.4473619461（CE 5.1187548637，CA 2.3286068439），四个进程均正常退出。
+本地已有旧的 ZeRO 分片断点，但无可由原 `eval.sh` 直接加载的合并 `model.bin`；
+本次没有执行独立基线评估，也没有生成新的 aIoU/AUC/SIM/MAE 指标。
 
 协议差异：原 `train.py` 使用 `split="test"` 做每轮验证并按 aIoU 选优，
 与规范中“不要拿 test 做模型选择”存在冲突。当前保留原入口行为，
