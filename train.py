@@ -68,6 +68,7 @@ def parse_args(args):
     )
     parser.add_argument("--grad_accumulation_steps", default=10, type=int)
     parser.add_argument("--workers", default=8, type=int)
+    parser.add_argument("--train_workers", default=2, type=int, help="DeepSpeed training I/O workers per rank (original default: 2)")
     parser.add_argument("--lr", default=0.0005, type=float)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--mask_loss_weight", default=2.0, type=float)
@@ -95,7 +96,15 @@ def parse_args(args):
     parser.add_argument("--dataset", default="PIADv2", type=str, choices=["PIADv1", "PIADv2"])
     parser.add_argument("--question_type", default="simple", type=str)
     parser.add_argument("--setting", default="Seen", type=str, choices=["Seen", "Unseen", "Unseen_afford", "Unseen_obj"])
-    parser.add_argument("--resume", default="", type=str, help="Path to checkpoint to resume from")
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument("--resume", "--resume_crag", dest="resume", default="", type=str,
+                                help="Resume complete training state; CRAG requires its saved contract and processor")
+    initialization.add_argument("--initialize_from_hammer", default="", type=str,
+                                help="Initialize only compatible VLM weights from HAMMER; never resume optimizer/epochs")
+    parser.add_argument("--hammer_lora_alpha", default=32.0, type=float,
+                        help="Declared source LoRA alpha for legacy HAMMER initialization")
+    parser.add_argument("--stop_after_epoch", default=None, type=int,
+                        help="Stop after this many completed epochs without changing the full scheduler horizon")
     parser.add_argument("--print_freq", default=1, type=int)
     parser.add_argument("--start_epoch", default=0, type=int, help="Starting epoch (overridden if resuming)")
     parser.add_argument("--auto_resume", action="store_true", default=False)
@@ -133,7 +142,19 @@ def parse_args(args):
         parser.error("--cf_index_path requires a positive --cf_loss_weight")
     if args.graph_knn < 1 or args.graph_long_range < 0:
         parser.error("graph_knn must be positive and graph_long_range nonnegative")
-    for name in ("processor_dir", "cf_index_path", "resume"):
+    if args.workers < 0 or args.train_workers < 0:
+        parser.error("worker counts must be nonnegative")
+    if args.stop_after_epoch is not None and not 1 <= args.stop_after_epoch <= args.epochs:
+        parser.error("stop_after_epoch must be within the unchanged full epoch schedule")
+    if args.initialize_from_hammer and args.model_variant not in ("crim", "crag3d"):
+        parser.error("initialize_from_hammer requires an explicit three-role model")
+    if args.initialize_from_hammer and (args.auto_resume or args.start_epoch):
+        parser.error("HAMMER weight initialization starts a fresh training run, not a resume")
+    if not 0 < args.hammer_lora_alpha < float("inf"):
+        parser.error("hammer_lora_alpha must be finite and positive")
+    if args.start_epoch < 0:
+        parser.error("start_epoch must be nonnegative")
+    for name in ("processor_dir", "cf_index_path", "resume", "initialize_from_hammer"):
         if getattr(args, name):
             setattr(args, name, str(Path(getattr(args, name)).expanduser().resolve()))
     return args
@@ -397,13 +418,69 @@ def run_crim_smoke(engine, loader, train_iter, scheduler, writer, logger, args, 
         raise RuntimeError(f"{args.model_variant} smoke verification failed: " + "; ".join(failures))
 
 
+def save_crag_checkpoint(engine, args, processor, contract, epoch, best_score, is_best, history, best_checkpoint):
+    """Commit a full epoch before replacing either the latest or best pointer."""
+    import torch.distributed as dist
+    from src.utils.crag_checkpoint import make_client_state, write_checkpoint_manifest
+    from src.utils.role_tokens import save_role_processor
+    from src.utils.training_state import capture_rng_state, state_signature
+
+    local_state = {"rng": capture_rng_state(), "signature": state_signature(engine)}
+    states = [None] * dist.get_world_size()
+    dist.all_gather_object(states, local_state)
+    client_state = make_client_state(contract, epoch, best_score, engine.global_steps,
+                                     rank_rng_states=[state["rng"] for state in states])
+    client_state.update(state_signatures=[state["signature"] for state in states], history=history,
+                        best_checkpoint=best_checkpoint)
+    tag = f"global_step{engine.global_steps}"
+    root = Path(args.log_dir) / "last_model"
+
+    def previous_tag(directory):
+        latest = directory / "latest"
+        return latest.read_text().strip() if latest.is_file() else None
+
+    def prune_previous(directory, previous):
+        if previous and previous != tag:
+            old = directory / previous
+            # Only delete a completed tag belonging to this output directory.
+            if (old.parent == directory and not old.is_symlink()
+                    and old.name == previous and (old / "crag_checkpoint.json").is_file()):
+                shutil.rmtree(old)
+
+    previous = previous_tag(root)
+    if not engine.save_checkpoint(str(root), tag=tag, client_state=client_state,
+                                  save_latest=False, exclude_frozen_parameters=False):
+        raise RuntimeError("DeepSpeed failed to save complete CRAG training state")
+    if args.local_rank == 0:
+        save_role_processor(processor, root / "processor", args.version)
+        best_previous = None
+        if is_best:
+            best_root = Path(args.log_dir) / "model"
+            best_previous = previous_tag(best_root)
+            best_root.mkdir(parents=True, exist_ok=True)
+            # Native state files are immutable per tag. Hard links preserve the
+            # original best-model location without a second optimizer save or
+            # a second copy of multi-GB tensors on this same filesystem.
+            shutil.copytree(root / tag, best_root / tag, copy_function=os.link)
+            save_role_processor(processor, best_root / "processor", args.version)
+            write_checkpoint_manifest(best_root, tag, client_state)
+        write_checkpoint_manifest(root, tag, client_state)
+        if is_best:
+            prune_previous(best_root, best_previous)
+        prune_previous(root, previous)
+    dist.barrier(device_ids=[args.local_rank])
+
+
 def main(args):
     args = parse_args(args)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
+    role_model = args.model_variant in ("crim", "crag3d")
     if args.auto_resume and not args.resume:
-        resume = os.path.join(args.log_dir, "model")
+        resume = os.path.join(args.log_dir, "last_model" if role_model else "model")
         if os.path.exists(os.path.join(resume, "latest")):
             args.resume = resume
+    if role_model and args.start_epoch and not args.resume:
+        raise ValueError("A nonzero CRAG epoch requires a complete training checkpoint")
     metadata = collect_provenance(args, Path(__file__).resolve().parent)
     if args.model_variant in ("partfield", "crim", "crag3d"):
         from src.utils.partfield_cache import cache_manifest
@@ -622,6 +699,16 @@ def main(args):
         p.requires_grad = True
     model.vlm.print_trainable_parameters()
 
+    if args.initialize_from_hammer:
+        from src.utils.hammer_initialization import initialize_from_hammer
+        metadata["initialization"] = initialize_from_hammer(
+            model, args.initialize_from_hammer, min(role_token_ids.values()),
+            source_lora_alpha=args.hammer_lora_alpha,
+        )
+        if args.local_rank == 0:
+            write_provenance(Path(args.log_dir) / "provenance.json", metadata)
+            logger.info("Initialized HAMMER VLM weights only; CRAG modules and training state are new: %s", metadata["initialization"])
+
     if args.dataset == "PIADv1":
         DatasetClass = PIADv1Afford
     elif args.dataset == "PIADv2":
@@ -714,6 +801,14 @@ def main(args):
         "min_loss_scale": 1,
     }
 
+    resume_contract = resume_manifest = None
+    if role_model:
+        from src.utils.crag_checkpoint import build_resume_contract, read_checkpoint_manifest, validate_client_state
+        from src.utils.training_state import restore_rng_state, state_signature
+        resume_contract = build_resume_contract(args, metadata, tokenizer, ds_config, world_size, model=model)
+        if args.resume:
+            resume_manifest = read_checkpoint_manifest(args.resume, resume_contract)
+
     model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
@@ -728,15 +823,41 @@ def main(args):
         config=ds_config,
     )
 
+    best_score = 0.0
+    best_checkpoint = None
+    history = []
+    resume_verification = None
     if args.resume:
         if args.local_rank == 0:
             logger.info(f"Loading checkpoint from {args.resume}")
-        load_path, client_state = model_engine.load_checkpoint(args.resume)
-        with open(os.path.join(args.resume, "latest"), "r") as f:
-            ckpt_dir = f.readlines()[0].strip()
-        args.start_epoch = (
-            int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
+        load_path, client_state = model_engine.load_checkpoint(
+            args.resume, tag=resume_manifest["tag"] if role_model else None,
+            load_module_strict=True, load_optimizer_states=True,
+            load_lr_scheduler_states=True, load_module_only=False,
         )
+        if load_path is None:
+            raise RuntimeError("DeepSpeed did not load the requested training checkpoint")
+        if role_model:
+            state = validate_client_state(client_state, resume_manifest, model_engine.global_steps)
+            args.start_epoch = state["next_epoch"]
+            best_score = state["best_iou"]
+            best_checkpoint = client_state.get("best_checkpoint")
+            history = client_state.get("history", [])
+            signature = state_signature(model_engine)
+            if signature != client_state["state_signatures"][args.local_rank]:
+                raise RuntimeError("Restored model/CONTACT/FP32 master/Adam/scheduler signature differs from saved state")
+            restore_rng_state(client_state["rng_states"][args.local_rank])
+            resume_verification = {"checkpoint": str(load_path), "next_epoch": args.start_epoch,
+                                   "global_steps": model_engine.global_steps, "best_iou": best_score,
+                                   "strict_model_load": True, "sampled_state_signature_matches": True,
+                                   "optimizer_restored": True, "scheduler_restored": True,
+                                   "rng_restored": True}
+            if args.local_rank == 0:
+                write_provenance(Path(args.log_dir) / "resume_verification.json", resume_verification)
+        else:
+            with open(os.path.join(args.resume, "latest"), "r") as f:
+                ckpt_dir = f.read().strip()
+            args.start_epoch = int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
         if args.local_rank == 0:
             logger.info(
                 "Resume training from {}, start from epoch {}".format(
@@ -771,11 +892,12 @@ def main(args):
         ),
     )
     
+    train_loader.num_local_io_workers = args.train_workers
     if args.smoke_check:
         # DeepSpeed otherwise starts its own workers regardless of --workers.
         # A single-batch check exits early, so avoid leaving prefetched workers alive.
         train_loader.num_local_io_workers = 0
-    train_iter = iter(train_loader)
+    train_iter = iter(train_loader) if args.smoke_check else None
     if args.smoke_check and args.model_variant in ("crim", "crag3d"):
         run_crim_smoke(model_engine, train_loader, train_iter, scheduler, writer, logger,
                        args, metadata, tokenizer)
@@ -830,7 +952,6 @@ def main(args):
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
         return
-    best_score = 0.0
     best_model = None
 
     if args.local_rank == 0:
@@ -846,16 +967,48 @@ def main(args):
         logger.info(f"Precision: {args.precision}")
         logger.info("=" * 50)
 
-    for epoch in range(args.start_epoch, args.epochs):
+    end_epoch = args.stop_after_epoch or args.epochs
+    if args.start_epoch >= end_epoch:
+        raise ValueError("The selected stopping boundary has already been completed by this checkpoint")
+    for epoch in range(args.start_epoch, end_epoch):
         if args.local_rank == 0:
             logger.info(f"Starting epoch {epoch + 1}/{args.epochs}")
+        if role_model:
+            # A complete epoch is the supported resume boundary. Recreate the
+            # original DS loader, retaining its random PIAD image/shape pairing.
+            if hasattr(train_loader.data_sampler, "set_epoch"):
+                train_loader.data_sampler.set_epoch(epoch)
+            train_iter = iter(train_loader)
+        elif train_iter is None:
+            train_iter = iter(train_loader)
         train_iter, steps = train(train_loader, model_engine, epoch, scheduler, writer, train_iter, args, logger)
 
         iou = validate(val_loader, model_engine, epoch, writer, args, logger, steps)
         is_best = iou > best_score
         best_score = max(best_score, iou)
 
-        if is_best:
+        if role_model:
+            if is_best:
+                best_checkpoint = {"directory": str(Path(args.log_dir) / "model"),
+                                   "tag": f"global_step{model_engine.global_steps}"}
+            history.append({"epoch": epoch, "global_steps": model_engine.global_steps,
+                            "is_best": is_best, "best_iou": best_score,
+                            "validation": args.last_validation_metrics})
+            save_crag_checkpoint(model_engine, args, processor, resume_contract, epoch,
+                                 best_score, is_best, history, best_checkpoint)
+            if args.local_rank == 0:
+                write_provenance(Path(args.log_dir) / "training_result.json", {
+                    "model_variant": args.model_variant, "git_commit": metadata["git"]["head"],
+                    "source_sha256": metadata["source_sha256"], "scheduled_epochs": args.epochs,
+                    "completed_epochs": epoch + 1, "global_steps": model_engine.global_steps,
+                    "full_schedule_completed": epoch + 1 == args.epochs,
+                    "latest_checkpoint": str(Path(args.log_dir) / "last_model"),
+                    "best_checkpoint": best_checkpoint, "best_iou": best_score,
+                    "history": history, "resume_verification": resume_verification,
+                })
+                logger.info("Complete CRAG checkpoint saved at epoch %s; best aIoU %.6f; is_best=%s",
+                            epoch + 1, best_score, is_best)
+        elif is_best:
             if args.local_rank == 0:
                 logger.info(f"New best IoU: {iou:.4f}, saving model...")
 
@@ -879,10 +1032,15 @@ def main(args):
                 logger.info(f"Checkpoint saved to {save_dir}")
 
     if args.local_rank == 0:
+        writer.close()
         wandb.finish()
         logger.info("=" * 50)
-        logger.info("TRAINING COMPLETED")
+        logger.info("TRAINING COMPLETED" if end_epoch == args.epochs else
+                    f"STOPPED AT REQUESTED EPOCH BOUNDARY {end_epoch}/{args.epochs}; full scheduler unchanged")
         logger.info("=" * 50)
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier(device_ids=[args.local_rank])
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

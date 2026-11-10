@@ -104,7 +104,8 @@ HAMMER 基线固定为 `e8aa2e6f5c705d1e58f129e9426870877be03011`，可从该提
 阶段 1 的真实单批前向/反向已通过。阶段 2 已完成全量离线缓存和模型接入，
 真实缓存的训练入口前向/反向检查已通过。阶段 3 的三角色 CRIM、训练集反事实监督
 和短程更新检查已完成。阶段 4 的 FGED 已接入 `crag3d` 并通过真实更新检查；
-阶段 5 的完整训练、断点和恢复验收尚未开始。
+阶段 5 的首轮完整训练、验证、断点保存与严格恢复已通过，其余轮次正在后台续跑；
+完整 30 轮日程尚未完成，阶段 6 尚未开始。
 
 原 shell 支持 `-m hammer|partfield|crim|crag3d`、`-c PARTFIELD_CACHE_DIR`，以及 `--` 后透传
 `train.py` 参数。新增参数包括 `--role_loss_weight`、`--graph_loss_weight`、
@@ -378,7 +379,112 @@ autograd 核验的最大误差为 `1.66893e-6`；`y0`、正负边权、部件分
 或报告正式评估增益。结果位于
 `exp/PIADv1_Seen_afford_obj_crag_stage4_fged_checked/smoke_result.json`，
 源码 SHA256 `a01a0a2e36d885894d3f7e3c31b7c130dc9c21737e9b395f4328ca10a89c8bf4`
-与验证快照及 provenance 一致。阶段 4 提交后停止，等待验收指令再进入阶段 5。
+与验证快照及 provenance 一致。阶段 4 交付后已停止，现按验收后的指令进入阶段 5。
+
+### 阶段 5：完整训练与严格断点恢复（首轮与恢复已通过，完整日程进行中）
+
+保留原 `train.py`、DeepSpeed ZeRO-2、LoRA、AdamW、WarmupDecayLR 和
+`tools/trainer.py` 的训练/验证调用。PIADv1 默认仍为 30 epochs、每轮 196 次 optimizer
+updates、全局 batch 64。当前运行使用 GPU 0–3、每卡 microbatch 2、累积 8、BF16；
+LoRA r=16/alpha=32，主 CE/CA 权重仍为 1/2。`--train_workers` 只控制 DeepSpeed
+训练 I/O worker 数，默认每 rank 2；`--workers` 仍控制验证 DataLoader，本次设为 2。
+
+两种加载语义明确区分：
+
+- `--initialize_from_hammer /absolute/legacy/checkpoint` 只初始化兼容的完整 VLM
+  基座及已有 LoRA，不恢复旧 optimizer、scheduler、epoch 或旧 3D 解码模块。全部 VLM
+  键和形状必须匹配；旧 `[CONT]` 行不复制，三个新角色行和 CRAG 模块保留新初始化。
+  旧 checkpoint 不记录 LoRA alpha，使用 `--hammer_lora_alpha` 声明源实验的实际值
+  （原 HAMMER 为 32），目标普通 LoRA 的 alpha 必须一致，不能由权重猜测。新增目标
+  LoRA 保留 A、清零 B，保持迁移时的 VLM 行为。本次完整训练没有启用旧 HAMMER 初始化。
+- `--resume_crag /absolute/crag/checkpoint`（与 `--resume` 同义）恢复完整训练状态。
+  原生 DS 断点包含 Qwen/LoRA、三个 token 的输入/输出 embedding、CRIM、CONTACT queue、
+  PartFieldAdapter、FGED、FP32 master、Adam moments 和 scheduler，并保存各 rank RNG。
+  加载前严格校验模型、词表、PartField 版本、数据清单、损失、训练参数与源码 SHA256；
+  加载使用 `load_module_strict=True`，且核对训练状态的抽样签名，旧 HAMMER 断点不能作为 CRAG resume。
+
+`exp/<experiment>/last_model` 保存每轮完整结束后的最新断点，`model` 保留原验证 aIoU
+选出的最佳断点。所有 rank 完成原生保存、processor 与完成合同落盘后，才原子更新
+`latest`；最佳断点通过同一文件系统上的 hard links 引用该轮原生分片，不重复保存一套
+多 GB 权重。成功发布新断点后清理该输出目录的上一份最新/最佳 tag，保留仍有 hard link
+引用的文件。只支持完整 epoch 边界恢复；重新创建 DataLoader workers，不能声称逐位重放
+之前预取的样本流。
+
+原入口仍验证 `split="test"` 并按其 aIoU 选优。这与实施规范中“不以 test 选模型”的要求
+有冲突，沿用原协议并在 `provenance.json` 中明确记录；没有改划分、`evaluate()` 的阈值或
+指标定义。以下验收指标属于此原入口验证，不冒充阶段 6 的完整对照评测。
+
+以下展示后台任务使用的原训练入口参数；任务已运行，无需重复启动。
+
+```bash
+# 已完成：完整首轮训练、验证和保存；总训练日程仍为 30 epochs。
+# 运行前在沙箱外确认 GPU 0–3 空闲，使用新的 -n 名称，避免覆盖源码快照。
+nvidia-smi
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+PYTHON_BIN=/home/hzl/miniconda3/envs/hammer/bin/python \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+bash scripts/train.sh -d PIADv1 -p Seen -m crag3d \
+  -c "$PWD/data/partfield_cache" -g 4 -b 64 -u 2 -e 30 -n crag_stage5_epoch1_verified \
+  -- --workers 2 --train_workers 2 --seed 3407 --debug --gradient_checkpointing --energy_steps 5 \
+  --cf_loss_weight 0.1 --cf_index_path "$PWD/data/cf_index/PIADv1_Seen.json" \
+  --stop_after_epoch 1
+
+# 当前后台续跑：在新实验目录恢复既定的 30 epochs；不再带 stop_after_epoch 1。
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+PYTHON_BIN=/home/hzl/miniconda3/envs/hammer/bin/python \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+bash scripts/train.sh -d PIADv1 -p Seen -m crag3d \
+  -c "$PWD/data/partfield_cache" -g 4 -b 64 -u 2 -e 30 -n crag_stage5_resumed \
+  -- --workers 2 --train_workers 2 --seed 3407 --debug --gradient_checkpointing --energy_steps 5 \
+  --cf_loss_weight 0.1 --cf_index_path "$PWD/data/cf_index/PIADv1_Seen.json" \
+  --resume_crag /home/hzl/my_project/Hammer/exp/PIADv1_Seen_afford_obj_crag_stage5_epoch1_verified/last_model
+```
+
+`--stop_after_epoch 1` 只设定本次进程停止的完整 epoch 边界，保持 `--epochs 30` 与
+5880-step scheduler 总日程。恢复时保持所有训练身份参数和源码一致，不能把首轮设为
+`-e 1` 后再改为 `-e 30` 来冒充同一 scheduler 的恢复；该变化会被合同拒绝。
+`--debug` 仅关闭外部 wandb 写入，TensorBoard、本地训练日志、验证与断点保存照常执行。
+
+首次 `crag_stage5_epoch1` 已执行 196 个训练步骤，但在验证日志 `100/253` 之后退出，
+没有错误栈，也没有产出 checkpoint，不能计作完整首轮通过。排查时无法读取 `dmesg`，
+退出原因尚未确定；保留原现场，使用新名称 `crag_stage5_epoch1_verified` 的重跑已完成。
+
+按用户确认，首轮及恢复后的余下 29 轮持续在后台执行并报告进度。独立 user systemd
+服务 `hammer-crag-stage5-20261110.service` 的 `RuntimeMaxSec=infinity`，由本地
+`exp/crag_stage5_run_20261110/runner.py` 顺序调用原 shell：先完成首轮并检查退出状态、
+`training_result.json` 和 `last_model/latest`，再重新检查 GPU 0–3 空闲，恢复并完成
+既定的 30-epoch 总日程。失败会写入状态并停止，不将后台启动等同于训练验收完成。
+runner、状态和运行日志均为被忽略的本地运行文件，不提交源码仓库。状态文件每 15 秒更新，
+标准输出分别记录在 `first_epoch.stdout.log` 与 `resumed_training.stdout.log`。
+
+```bash
+# 查询当前后台服务及其最新训练/验证进度。
+systemctl --user status hammer-crag-stage5-20261110.service --no-pager
+cat /home/hzl/my_project/Hammer/exp/crag_stage5_run_20261110/status.json
+```
+
+当前训练源码 SHA256 为
+`b60144512d0c893517a5168d10e28ee284d65899d1d39769f3c38ccfa6ca5831`，
+首轮与恢复快照、provenance 和当前源码一致。2026-11-10 的重跑完成原入口规定的
+196 个优化步骤（全局 batch 64）和全部 1012 个验证样本，首轮结果为：
+
+| 已完成 epoch | AUC | aIoU | SIM | MAE |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 0.81220120 | 0.11706334 | 0.49816824 | 0.11194252 |
+
+原生 `global_step196` 断点包含完整模型和四份 BF16 ZeRO-2 optimizer 分片，四个 rank
+正常退出。完成合同、分片库存和词表校验通过，最新与最佳断点的原生分片 hard links
+已核验。续跑以 `load_module_strict=True` 加载，四个 rank 的模型、角色行、CONTACT
+队列、FP32 master、Adam 与 scheduler 抽样签名均匹配，RNG 已恢复；`global_steps=196`、
+`best_iou=0.1170633414` 和下一个 epoch 均已恢复。恢复后已实际执行第 2 轮的优化步骤，
+没有重置 optimizer、预热或完整 5880-step scheduler。
+
+这些结果验证了训练和断点链路；仅有一轮验证结果，不能据此声称优于 HAMMER。
+第 2–30 轮持续运行，`full_schedule_completed` 当前仍为 `false`；完整日程结果待补充。
+首轮记录位于
+`exp/PIADv1_Seen_afford_obj_crag_stage5_epoch1_verified/{provenance.json,train.log,training_result.json}`；
+恢复证据位于 `exp/PIADv1_Seen_afford_obj_crag_stage5_resumed/resume_verification.json`，
+最终日程结果在该恢复实验的 `training_result.json`。阶段 6 尚未开始。
 
 ## :books: License
 This repository is released under the [MIT license](LICENSE).

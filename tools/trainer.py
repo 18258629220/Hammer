@@ -208,6 +208,11 @@ def validate(val_loader, model, epoch, writer, args, logger, steps):
     sim_meter.all_reduce()
     iou_meter.all_reduce()
     mae_meter.all_reduce()
+    args.last_validation_metrics = {
+        "auc": auc_meter.avg, "aiou": iou_meter.avg,
+        "sim": sim_meter.avg, "mae": mae_meter.avg,
+        "gathered_samples": len(gt_affords),
+    }
 
     if args.local_rank == 0:
         writer.add_scalar("val/auc", auc_meter.avg, epoch)
