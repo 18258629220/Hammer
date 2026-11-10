@@ -24,7 +24,15 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
         "role_loss", "cf_loss", "effect_loss", "exclude_loss", "contact_loss", "separation_loss",
         "contact_valid_anchors", "contact_positive_pairs", "contact_negative_pairs",
         "contact_queue_size", "hard_negative_count", "hard_negative_parts", "cf_valid_pairs",
-    ) if getattr(args, "model_variant", "hammer") == "crim" else ()
+    ) if getattr(args, "model_variant", "hammer") in ("crim", "crag3d") else ()
+    if getattr(args, "model_variant", "hammer") == "crag3d":
+        extra_names += (
+            "part_loss", "graph_loss", "aux_loss", "graph_positive_loss", "graph_negative_loss",
+            "node_exclusion_loss", "part_supervised_count", "graph_positive_edges", "graph_negative_edges",
+            "graph_uncertain_edges", "graph_supervised_edges", "edge_count", "long_range_edge_count",
+            "energy_initial", "energy_final", "refinement_mean_abs", "energy_positive_weight",
+            "energy_negative_weight", "energy_exclusion_weight",
+        )
     extra_meters = {name: AverageMeter(name, ":.4f") for name in extra_names}
 
     progress = ProgressMeter(
@@ -76,6 +84,17 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
         steps = global_step + epoch * args.steps_per_epoch
 
         if global_step % args.print_freq == 0:
+            heatmaps = None
+            if "y0" in output_dict:
+                # Use the original evaluator on the last training microbatch
+                # from every rank. These diagnostics do not select checkpoints.
+                heatmaps = torch.stack((output_dict["y0"].detach().float(),
+                                        output_dict["pred_afford"].detach().float(),
+                                        input_dict["gt_affords"].detach().float()), dim=0)
+                if args.distributed:
+                    gathered = [torch.empty_like(heatmaps) for _ in range(torch.distributed.get_world_size())]
+                    torch.distributed.all_gather(gathered, heatmaps.contiguous())
+                    heatmaps = torch.cat(gathered, dim=1)
             if args.distributed:
                 batch_time.all_reduce()
                 data_time.all_reduce()
@@ -106,7 +125,18 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
                     writer.add_scalar(name, value, steps)
                 if extra_log:
                     wandb.log(extra_log, step=steps)
-                    logger.info("CRIM losses/counts: %s", extra_log)
+                    logger.info("Role/geometry losses and counts: %s", extra_log)
+                if heatmaps is not None:
+                    initial_aiou = evaluate(heatmaps[0], heatmaps[2])[1]
+                    final_aiou = evaluate(heatmaps[1], heatmaps[2])[1]
+                    writer.add_scalar("train/initial_aiou", initial_aiou, steps)
+                    writer.add_scalar("train/final_aiou", final_aiou, steps)
+                    wandb.log({"train/initial_aiou": initial_aiou, "train/final_aiou": final_aiou}, step=steps)
+                    logger.info("Training-batch aIoU y0=%.6f y_final=%.6f", initial_aiou, final_aiou)
+                    if getattr(args, "smoke_check", False):
+                        if not hasattr(args, "refinement_metrics"):
+                            args.refinement_metrics = []
+                        args.refinement_metrics.append({"step": steps, "initial_aiou": initial_aiou, "final_aiou": final_aiou})
 
             batch_time.reset()
             data_time.reset()

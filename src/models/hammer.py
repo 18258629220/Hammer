@@ -20,6 +20,9 @@ from src.models.crag.partfield_adapter import PartFieldAdapter
 from src.models.crag.role_interaction import RoleInteraction
 from src.models.crag.crag_losses import CRIMLoss
 from src.models.crag.counterfactual import counterfactual_loss
+from src.models.crag.functional_graph import FunctionalGraph
+from src.models.crag.energy_decoder import EnergyDecoder
+from src.models.crag.functional_losses import FunctionalGraphLoss
     
 
 class SwapAxes(nn.Module):
@@ -191,11 +194,13 @@ class SegModel(nn.Module):
         point_embd_dim = kwargs.get("point_embd_dim", 512)
         point_N_p = kwargs.pop("point_N_p", 64)
         point_normal_channel = kwargs.pop("point_normal_channel", False)
-        if kwargs.get("model_variant", "hammer") in ("partfield", "crim"):
+        if kwargs.get("model_variant", "hammer") in ("partfield", "crim", "crag3d"):
             feature_dim = kwargs.get("partfield_feature_dim")
             if not isinstance(feature_dim, int) or isinstance(feature_dim, bool) or feature_dim < 1:
                 raise ValueError("PartField feature_dim must be a positive integer from the cache manifest")
             self.partfield_adapter = PartFieldAdapter(feature_dim, embedding_dim=point_embd_dim)
+            if kwargs.get("model_variant") == "crag3d":
+                return  # FGED replaces both the legacy lifting stack and decoder.
         else:
             self.point_backbone = PointBackbone(
                 emb_dim=point_embd_dim,
@@ -239,10 +244,8 @@ class Hammer(nn.Module):
     def __init__(self, config, **kwargs):
         super(Hammer, self).__init__()
         self.model_variant = kwargs.pop("model_variant", "hammer")
-        if self.model_variant not in ("hammer", "partfield", "crim"):
-            raise NotImplementedError(
-                f"Model variant {self.model_variant!r} requires the CRIM/FGED stages; refusing to use another variant as a fallback."
-            )
+        if self.model_variant not in ("hammer", "partfield", "crim", "crag3d"):
+            raise ValueError(f"Unknown model variant: {self.model_variant!r}")
         kwargs["model_variant"] = self.model_variant
         self.cont_token_idx = kwargs.pop("cont_token_idx", None)
         vlm_out_dim = kwargs["vlm_out_dim"]
@@ -261,7 +264,7 @@ class Hammer(nn.Module):
         )
         self.seg_model = SegModel(config, **kwargs)
 
-        if self.model_variant == "crim":
+        if self.model_variant in ("crim", "crag3d"):
             self.role_token_ids = kwargs["role_token_ids"]
             self.image_token_id = config.image_token_id
             self.crim = RoleInteraction(config.hidden_size, point_embd_dim)
@@ -269,6 +272,17 @@ class Hammer(nn.Module):
             self.role_loss_weight = kwargs.get("role_loss_weight", 1.0)
             self.cf_loss_weight = kwargs.get("cf_loss_weight", 0.0)
             self.cf_overlap_threshold = kwargs.get("cf_overlap_threshold", 0.7)
+            if self.model_variant == "crag3d":
+                self.functional_graph = FunctionalGraph(
+                    embedding_dim=point_embd_dim, partfield_dim=kwargs["partfield_feature_dim"],
+                    knn_neighbors=kwargs.get("graph_knn", 16),
+                    long_range_neighbors=kwargs.get("graph_long_range", 4),
+                )
+                self.energy_decoder = EnergyDecoder(steps=kwargs.get("energy_steps", 5))
+                self.functional_losses = FunctionalGraphLoss()
+                self.part_loss_weight = kwargs.get("part_loss_weight", 1.0)
+                self.graph_loss_weight = kwargs.get("graph_loss_weight", 0.1)
+                self.aux_loss_weight = kwargs.get("aux_loss_weight", 0.5)
         else:
             self.projection = nn.Sequential(
                 nn.Linear(vlm_out_dim, point_embd_dim),
@@ -318,7 +332,7 @@ class Hammer(nn.Module):
     ):
         B = points.shape[0]
         assert B == len(offset) - 1, "Batch size mismatch with offset length"
-        if self.model_variant in ("partfield", "crim") and (
+        if self.model_variant in ("partfield", "crim", "crag3d") and (
             partfield_features is None or partfield_part_ids is None
         ):
             raise ValueError("PartField mode requires frozen feature/part-ID caches for every sample")
@@ -333,7 +347,7 @@ class Hammer(nn.Module):
             output_hidden_states=True,
         )
         output_hidden_states = output.hidden_states[-1]
-        if self.model_variant == "crim":
+        if self.model_variant in ("crim", "crag3d"):
             return self.crim_forward(
                 output, output_hidden_states, input_ids, labels, attention_masks,
                 offset, points, gt_affords, partfield_features, partfield_part_ids,
@@ -400,8 +414,17 @@ class Hammer(nn.Module):
         role_output = self.crim(hidden_states, input_ids, attention_masks, labels,
                                 offset, self.role_token_ids, self.image_token_id)
         roles = role_output["roles"]
-        lifted = self.seg_model.lift_to_3d(roles, encoded["multi_scale_features"])
-        pred_afford = self.seg_model.afford_decoder(encoded["point_features"], lifted)
+        graph = decoded = None
+        if self.model_variant == "crag3d":
+            graph = self.functional_graph(points, features, part_ids, encoded, roles)
+            decoded = self.energy_decoder(
+                graph["y0"], graph["edge_index"], graph["positive_weights"],
+                graph["negative_weights"], graph["anchor_confidence"], graph["exclusion"],
+            )
+            pred_afford = decoded["pred_afford"]
+        else:
+            lifted = self.seg_model.lift_to_3d(roles, encoded["multi_scale_features"])
+            pred_afford = self.seg_model.afford_decoder(encoded["point_features"], lifted)
         loss_ce = output.loss * self.ce_loss_weight
         loss_ca = ca_loss(pred_afford, gt_affords) * self.mask_loss_weight
         losses = self.crim_losses(
@@ -411,6 +434,25 @@ class Hammer(nn.Module):
         )
         result = dict(losses, ce_loss=loss_ce, ca_loss=loss_ca, pred_afford=pred_afford)
         result["loss"] = loss_ce + loss_ca + self.role_loss_weight * losses["role_loss"]
+        if graph is not None:
+            graph_losses = self.functional_losses(graph, gt_affords, part_ids, points, features)
+            aux_loss = ca_loss(graph["y0"], gt_affords)
+            result.update(graph_losses)
+            result["aux_loss"] = aux_loss
+            result["loss"] = (result["loss"] + self.part_loss_weight * graph_losses["part_loss"]
+                              + self.graph_loss_weight * graph_losses["graph_loss"]
+                              + self.aux_loss_weight * aux_loss)
+            result.update(
+                y0=graph["y0"], y_final=pred_afford, part_scores=graph["part_scores"],
+                energy_history=decoded["energy_history"],
+                energy_initial=decoded["energy_history"][:, 0].mean(),
+                energy_final=decoded["energy_history"][:, -1].mean(),
+                refinement_mean_abs=(pred_afford-graph["y0"]).abs().mean(),
+                edge_count=graph["edge_count"], long_range_edge_count=graph["long_range_edge_count"],
+                energy_positive_weight=decoded["energy_coefficients"][0],
+                energy_negative_weight=decoded["energy_coefficients"][1],
+                energy_exclusion_weight=decoded["energy_coefficients"][2],
+            )
         if self.cf_loss_weight > 0 and self.training and not inference:
             if canonical_indices is None or point_keys is None:
                 raise ValueError("Counterfactual supervision requires original-to-canonical indices and point identities")
@@ -426,5 +468,8 @@ class Hammer(nn.Module):
             result["role_features"] = roles
             result["contact_attention"] = role_output["contact_attention"]
             result["image_token_counts"] = role_output["image_token_counts"]
+            if graph is not None:
+                result["functional_graph"] = graph
+                result["energy_step_sizes"] = decoded["step_sizes"]
         return result
 

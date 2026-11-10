@@ -103,11 +103,12 @@ bash scripts/eval.sh
 HAMMER 基线固定为 `e8aa2e6f5c705d1e58f129e9426870877be03011`，可从该提交恢复原版。
 阶段 1 的真实单批前向/反向已通过。阶段 2 已完成全量离线缓存和模型接入，
 真实缓存的训练入口前向/反向检查已通过。阶段 3 的三角色 CRIM、训练集反事实监督
-和短程更新检查已完成；阶段 4 FGED 尚未实现，选择 `crag3d` 仍会明确报错。
+和短程更新检查已完成。阶段 4 的 FGED 已接入 `crag3d` 并通过真实更新检查；
+阶段 5 的完整训练、断点和恢复验收尚未开始。
 
 原 shell 支持 `-m hammer|partfield|crim|crag3d`、`-c PARTFIELD_CACHE_DIR`，以及 `--` 后透传
 `train.py` 参数。新增参数包括 `--role_loss_weight`、`--graph_loss_weight`、
-`--cf_loss_weight` 和 `--energy_steps`；角色与 CF 权重已接入训练，图和能量参数留待阶段 4。
+`--cf_loss_weight` 和 `--energy_steps`；角色、CF、部件、图和辅助损失权重及能量迭代参数已生效。
 shell 仍使用四 GPU、全局 batch 64、30 epochs 的默认规格；`-u` 设置每卡微批大小，
 默认仍为 1，并据此计算梯度累积、检查全局 batch 整除关系。
 LoRA 目标名称会去除首尾空格，确保默认 `q_proj, v_proj` 均能匹配。
@@ -136,8 +137,8 @@ PYTHON_BIN=/path/to/hammer/bin/python bash scripts/train.sh -d PIADv1 -p Seen -n
 核对四个兼容输出键、有限数值及预测/GT 形状，并执行反向。所有 rank 完成后，
 rank 0 写入 `smoke_result.json`，记录损失、预测形状、GPU 映射、源码哈希及反向状态。
 该模式使用零个训练 DataLoader worker，并在退出前销毁分布式进程组；不执行
-optimizer step、不保存权重。`crim` 的 `-s` 则通过原 trainer 执行有限个真实更新步骤，
-默认 `--smoke_optimizer_steps 3`，用于核对新 token 和角色参数的更新；同样不保存训练权重。
+optimizer step、不保存权重。`crim`、`crag3d` 的 `-s` 则通过原 trainer 执行有限个真实更新步骤，
+默认 `--smoke_optimizer_steps 3`，核对 token、角色及相应图/能量参数的梯度和更新；同样不保存训练权重。
 正式训练仍保留原 DataLoader 和训练主循环。
 
 2026-11-09 的阶段 1 检查：Python/Bash 语法和原 shell 的 `-P` 预检通过，
@@ -301,14 +302,83 @@ processor 保存、`role_tokens.json` 词表 SHA256 及本地重新加载校验�
 所有 rank 的三个 token 行和三个角色头均有实际更新，最大变化均为 `1.9073486328125e-6`；
 每个样本的角色特征为 `[3,512]`，均有梯度，角色间最小距离大于 31.23。
 预测形状为 `[2,2048,1]`，adapter 尺寸为 `[2,64,512]`、`[2,128,512]`、
-`[2,512,512]`、`[2,2048,512]`，当前源码 SHA256 与验证快照及 provenance 一致。
+`[2,512,512]`、`[2,2048,512]`，该阶段提交时源码 SHA256 与验证快照及 provenance 一致。
 固定训练批次的 eval CE 从
 `6.4615869522` 降至 `6.4582962990`，累计有 180 个合法 CONTACT anchors、96 个合法 CF 配对。
 四个 rank 正常退出，GPU 0–3 已释放，细节记录在该实验的 `smoke_result.json`。
 
 代码在训练保存 CRIM checkpoint 时同步保存 processor，恢复时校验 token 合同；
 本次只验证了 tokenizer 往返保存及真实参数更新，未产出或恢复完整 CRIM 训练 checkpoint，
-未报告长期收敛结果或新的评测精度。阶段 3 提交后停止，等待验收指令再进入阶段 4。
+未报告长期收敛结果或新的评测精度。
+
+### 阶段 4：功能关系图与可微能量解码
+
+`-m crag3d` 使用 PartField + 三角色 CRIM + FGED，完整模式中的 FGED 替换旧的
+LiftTo3D/AffordDecoder；其他三个模型模式保留各自路径。FunctionalGraph 先用部件原型
+和几何特征形成部件表示，再由 EFFECT/EXCLUDE 共同计算功能分数，融合点特征与三角色
+得到 `y0`、正证据置信度（下界 0.5）和负证据。GT 只进入随后的损失分支。
+
+稀疏图每点最多包含 16 条局部 kNN 边和 4 条同簇远距离边；N=2048 时每个 shape
+最多有 40,960 个边槽，padding 不参与能量或监督。距离查询分块、边 MLP 使用 activation
+checkpoint，保持 O(Nk) 边存储，不分配完整 N×N 邻接。正负边分别受 EFFECT/EXCLUDE
+条件化，并以冻结 PartField 特征交互为主要判别依据。
+
+能量包含正证据 anchoring、正边平滑、负边排斥和负证据惩罚四项。非负系数用 softplus
+参数化，按 Hessian 的 Gershgorin 上界确定安全步长，在 FP32 中执行默认 5 次投影更新。
+解析梯度对每条边的两端同时累加，保留 `y0`、边权和角色的梯度链；推理也能在 `no_grad`
+下运行。输出保留原四个兼容键，`pred_afford` 为 `y_final`，另提供 `y0`、`part_scores`
+和 `energy_history` 供日志或可视化读取。
+
+主 CE/CA 权重仍为 1/2，保留角色和 CF 损失；新增部件、图、`y0` 辅助 CA 损失的默认
+权重分别为 1、0.1、0.5。图损失包含正/负边软 BCE 与节点负证据 BCE；高/低响应阈值为
+0.6/0.1，负候选要求归一化空间距离不超过 1.5 或冻结 PF cosine 不低于 0.5，
+中间响应降低监督权重。训练日志复用原 `evaluate()` 比较各 rank 最后一个微批的
+`aIoU(y0)` 与 `aIoU(y_final)`；这是训练诊断，不用于选择 checkpoint，也不改变原评测定义。
+
+```bash
+# 先在沙箱外确认 GPU 0–3 空闲；重跑时使用新的 -n 名称。
+nvidia-smi
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+PYTHON_BIN=/home/hzl/miniconda3/envs/hammer/bin/python \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+bash scripts/train.sh -d PIADv1 -p Seen -m crag3d \
+  -c "$PWD/data/partfield_cache" -g 4 -b 64 -u 2 -n crag_stage4_fged_checked -s \
+  -- --workers 0 --seed 3407 --cf_loss_weight 0.1 \
+  --cf_index_path "$PWD/data/cf_index/PIADv1_Seen.json" \
+  --smoke_optimizer_steps 3 --gradient_checkpointing --energy_steps 5
+```
+
+2026-11-10 的最终检查通过原入口完成 3 个真实 optimizer steps：四卡、每卡 microbatch 2、
+累积 8，全局 batch 仍为 64，预测形状为 `[2,2048,1]`。真实图上的解析能量梯度与
+autograd 核验的最大误差为 `1.66893e-6`；`y0`、正负边权、部件分数、置信度和负证据
+都有真实梯度。部件角色匹配、正/负边、初始概率及 PF 投影参数均实际更新，最大变化为
+`1.9073486e-6`，能量步长参数变化为 `9.983778e-7`。能量系数原始参数有梯度，
+但本次 3 步内其 BF16 可见值未变化。
+
+每个 shape 的 5 步能量均未增加；首个 rank 0 样本的能量为
+`288.597443 → 262.709778`。输出确实经过优化，所有检查批次的最小平均绝对改变量
+不低于 `0.01014`。将 GT 置零后，预测最大差值不超过 `1.192093e-7`，
+与 GT 不参与构图和预测的代码路径一致。
+
+短程诊断没有显示精度收益。固定训练样本的 CE 为
+`6.4615869522 → 6.4638719559`（上升）；训练微批的原 aIoU 为：
+
+| 更新步骤 | y0 aIoU | y_final aIoU |
+| --- | ---: | ---: |
+| 0 | 0.03145139 | 0.02965192 |
+| 1 | 0.02843804 | 0.02371100 |
+| 2 | 0.02885658 | 0.02808001 |
+
+首次检查沿用阶段 3 的“CE 必须下降”断言而失败。最终将验收条件按阶段目标区分：
+`crim` 仍要求固定 CE 探针下降，`crag3d` 检查有限数值、解析梯度、能量过程和真实参数更新，
+同时如实记录 CE 升降；没有改模型、权重或协议来制造提升。失败检查也保存诊断并清理
+分布式进程组。能量下降不等于 aIoU 提升，仍需完整训练和正式评估验证。
+
+最终四个 rank 正常退出，GPU 0–3 已释放；没有运行完整 epoch、产出完整 checkpoint
+或报告正式评估增益。结果位于
+`exp/PIADv1_Seen_afford_obj_crag_stage4_fged_checked/smoke_result.json`，
+源码 SHA256 `a01a0a2e36d885894d3f7e3c31b7c130dc9c21737e9b395f4328ca10a89c8bf4`
+与验证快照及 provenance 一致。阶段 4 提交后停止，等待验收指令再进入阶段 5。
 
 ## :books: License
 This repository is released under the [MIT license](LICENSE).

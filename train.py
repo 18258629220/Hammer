@@ -75,6 +75,10 @@ def parse_args(args):
     parser.add_argument("--partfield_cache_dir", default="", type=str)
     parser.add_argument("--role_loss_weight", default=1.0, type=float)
     parser.add_argument("--graph_loss_weight", default=0.1, type=float)
+    parser.add_argument("--part_loss_weight", default=1.0, type=float)
+    parser.add_argument("--aux_loss_weight", default=0.5, type=float)
+    parser.add_argument("--graph_knn", default=16, type=int)
+    parser.add_argument("--graph_long_range", default=4, type=int)
     parser.add_argument("--cf_loss_weight", default=0.0, type=float)
     parser.add_argument("--energy_steps", default=5, type=int)
     parser.add_argument("--cf_index_path", default="", type=str)
@@ -106,7 +110,7 @@ def parse_args(args):
     for name in ("epochs", "steps_per_epoch", "batch_size", "val_batch_size", "grad_accumulation_steps", "energy_steps"):
         if getattr(args, name) < 1:
             parser.error(f"--{name} must be positive")
-    for name in ("role_loss_weight", "graph_loss_weight", "cf_loss_weight"):
+    for name in ("role_loss_weight", "graph_loss_weight", "cf_loss_weight", "part_loss_weight", "aux_loss_weight"):
         value = getattr(args, name)
         if not 0 <= value < float("inf"):
             parser.error(f"--{name} must be finite and nonnegative")
@@ -114,19 +118,21 @@ def parse_args(args):
     args.log_base_dir = str(Path(args.log_base_dir).expanduser().resolve())
     if args.partfield_cache_dir:
         args.partfield_cache_dir = str(Path(args.partfield_cache_dir).expanduser().resolve())
-    if args.model_variant in ("partfield", "crim") and not args.partfield_cache_dir:
+    if args.model_variant in ("partfield", "crim", "crag3d") and not args.partfield_cache_dir:
         parser.error(f"--model_variant {args.model_variant} requires --partfield_cache_dir")
     if not 0 < args.cf_overlap_threshold < 1:
         parser.error("cf_overlap_threshold must be in (0,1)")
     if args.smoke_optimizer_steps < 2:
         parser.error("smoke_optimizer_steps must be at least two because the original warmup starts at zero LR")
     if args.cf_loss_weight > 0:
-        if args.model_variant != "crim" or not args.cf_index_path:
-            parser.error("Counterfactual supervision requires --model_variant crim and --cf_index_path")
+        if args.model_variant not in ("crim", "crag3d") or not args.cf_index_path:
+            parser.error("Counterfactual supervision requires a three-role model and --cf_index_path")
         if args.batch_size < 2 or args.batch_size % 2:
             parser.error("Counterfactual pairs require an even local --batch_size >= 2; preserve global batch via accumulation")
     elif args.cf_index_path:
         parser.error("--cf_index_path requires a positive --cf_loss_weight")
+    if args.graph_knn < 1 or args.graph_long_range < 0:
+        parser.error("graph_knn must be positive and graph_long_range nonnegative")
     for name in ("processor_dir", "cf_index_path", "resume"):
         if getattr(args, name):
             setattr(args, name, str(Path(getattr(args, name)).expanduser().resolve()))
@@ -155,9 +161,35 @@ def run_crim_smoke(engine, loader, train_iter, scheduler, writer, logger, args, 
     token_before = embedding.detach().index_select(0, role_ids).float().clone()
     watched = {name: model.crim.role_projections[name][0].weight for name in args.role_token_ids}
     parameter_before = {name: value.detach().float().clone() for name, value in watched.items()}
+    fged_watched = {}
+    if args.model_variant == "crag3d":
+        if any(hasattr(model.seg_model, name) for name in ("point_backbone", "lift_to_3d", "afford_decoder")):
+            raise RuntimeError("Full CRAG-3D must use FGED without legacy point encoding/decoding modules")
+        graph_module = model.functional_graph
+        fged_watched = {
+            "part_effect": graph_module.part_effect_projection.weight,
+            "part_exclude": graph_module.part_exclude_projection.weight,
+            "positive_affinity": graph_module.positive_edge_head[0].weight,
+            "negative_affinity": graph_module.negative_edge_head[0].weight,
+            "point_seed": graph_module.initial_probability[0].weight,
+            "partfield_projection": graph_module.partfield_projection.weight,
+            "energy_step": model.energy_decoder.step_fraction_logit,
+            "energy_coefficients": model.energy_decoder.raw_coefficients,
+        }
+    fged_before = {name: value.detach().float().clone() for name, value in fged_watched.items()}
+    fged_param_grad = {name: torch.zeros((), device=device) for name in fged_watched}
+    fged_tensor_grad = {name: torch.zeros((), device=device) for name in
+                        ("y0", "positive_weights", "negative_weights", "part_scores", "anchor_confidence", "exclusion")}
     token_grad = torch.zeros(3, device=device)
     role_grad = torch.zeros(3, device=device)
     observations = {"microbatches": 0, "loss_sums": {}, "roles_min_pair_distance": float("inf")}
+    if fged_watched:
+        observations["fged"] = {"gradient_error_max": None, "minimum_refinement_change": float("inf")}
+
+    def accumulate_gradient(grad, destination):
+        if not torch.isfinite(grad).all():
+            raise RuntimeError("Non-finite FGED gradient")
+        destination.add_(grad.detach().float().abs().sum())
 
     def token_hook(grad):
         selected = grad.detach().index_select(0, role_ids).float()
@@ -195,6 +227,52 @@ def run_crim_smoke(engine, loader, train_iter, scheduler, writer, logger, args, 
         observations["image_token_counts"] = output["image_token_counts"].detach().cpu().tolist()
         if not torch.allclose(output["contact_attention"].sum(-1), torch.ones(len(roles), device=device), atol=1e-5):
             raise RuntimeError("CONTACT attention does not normalize over actual image tokens")
+        if fged_watched:
+            graph = output["functional_graph"]
+            for name in ("part_loss", "graph_loss", "aux_loss"):
+                if not torch.isfinite(output[name]).all():
+                    raise RuntimeError(f"Non-finite FGED loss: {name}")
+            count = output["y0"].shape[1]
+            if graph["edge_index"].shape[-1] > count * (min(args.graph_knn, count-1) + args.graph_long_range):
+                raise RuntimeError("Functional graph exceeded its sparse O(Nk) edge budget")
+            source, target = graph["edge_index"].unbind(1)
+            if ((source == target) & graph["edge_mask"]).any():
+                raise RuntimeError("Functional graph contains a valid self-loop")
+            for name, value in graph.items():
+                if name in fged_tensor_grad:
+                    if value.dtype != torch.float32:
+                        raise RuntimeError(f"FGED arithmetic did not remain FP32: {name}")
+                    value.register_hook(lambda grad, name=name: accumulate_gradient(grad, fged_tensor_grad[name]))
+            for name in ("positive_weights", "negative_weights"):
+                if graph[name][~graph["edge_mask"]].count_nonzero():
+                    raise RuntimeError("Padding edges contributed nonzero affinity")
+            history = output["energy_history"].detach()
+            if history.shape != (len(roles), args.energy_steps+1):
+                raise RuntimeError("Unrolled energy history has an incorrect number of steps")
+            if (history[:, 1:] > history[:, :-1] + 1e-5 * history[:, :-1].abs().clamp_min(1)).any():
+                raise RuntimeError("A projected energy step increased the defined energy")
+            change = (output["y_final"]-output["y0"]).abs().mean().item()
+            diagnostics = observations["fged"]
+            diagnostics["minimum_refinement_change"] = min(diagnostics["minimum_refinement_change"], change)
+            diagnostics["last_energy_history"] = history.cpu().tolist()
+            diagnostics["edge_slots_per_shape"] = graph["edge_index"].shape[-1]
+            diagnostics["max_outgoing_edges"] = graph["max_outgoing_edges"]
+            if diagnostics["gradient_error_max"] is None:
+                diagnostics["first_energy_history"] = diagnostics["last_energy_history"]
+                # Compare exact dE/dy on this real graph with independent
+                # autograd, keeping the training decoder graph untouched.
+                reference_decoder = copy.deepcopy(model.energy_decoder).requires_grad_(False)
+                with torch.enable_grad(), torch.autocast("cuda", enabled=False):
+                    seed = graph["y0"].detach()
+                    candidate = (.8 * seed + .1).clone().requires_grad_(True)
+                    arguments = (seed, graph["edge_index"], graph["positive_weights"].detach(),
+                                 graph["negative_weights"].detach(), graph["anchor_confidence"].detach(),
+                                 graph["exclusion"].detach())
+                    reference = torch.autograd.grad(reference_decoder.energy(candidate, *arguments).sum(), candidate)[0]
+                    analytic = model.energy_decoder.gradient(candidate, *arguments)
+                    if not torch.allclose(reference, analytic, rtol=2e-4, atol=2e-5):
+                        raise RuntimeError("Analytic energy gradient disagrees with the defined energy")
+                    diagnostics["gradient_error_max"] = (reference-analytic).abs().max().item()
 
     raw_probe = next(train_iter)
     probe = dict_to_cuda(dict(raw_probe))
@@ -205,6 +283,14 @@ def run_crim_smoke(engine, loader, train_iter, scheduler, writer, logger, args, 
         with torch.no_grad(), torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
             output = engine(**probe)
             value = output["ce_loss"].float().detach()
+            if fged_watched and observations["microbatches"]:
+                original_prediction = output["pred_afford"].detach()
+                changed_target = dict(probe, gt_affords=torch.zeros_like(probe["gt_affords"]))
+                changed_output = engine(**changed_target)
+                difference = (original_prediction-changed_output["pred_afford"]).abs().max().item()
+                if not torch.allclose(original_prediction, changed_output["pred_afford"], atol=1e-6, rtol=1e-5):
+                    raise RuntimeError("Ground-truth heatmaps entered the FGED prediction path")
+                observations["fged"]["gt_perturbation_prediction_max_difference"] = difference
         if not torch.equal(queue_count, model.crim_losses.queue_count):
             raise RuntimeError("Evaluation data changed the training-only CONTACT queue")
         return value
@@ -212,6 +298,8 @@ def run_crim_smoke(engine, loader, train_iter, scheduler, writer, logger, args, 
     ce_before = probe_ce()
     embedding_hook = embedding.register_hook(token_hook)
     output_hook = model.register_forward_hook(observe)
+    fged_hooks = [value.register_hook(lambda grad, name=name: accumulate_gradient(grad, fged_param_grad[name]))
+                  for name, value in fged_watched.items()]
     smoke_args = copy.copy(args)
     smoke_args.steps_per_epoch = args.smoke_optimizer_steps
     smoke_args.print_freq = 1
@@ -219,6 +307,8 @@ def run_crim_smoke(engine, loader, train_iter, scheduler, writer, logger, args, 
     train_iter, _ = train(loader, engine, 0, scheduler, writer, chain([raw_probe], train_iter), smoke_args, logger)
     embedding_hook.remove()
     output_hook.remove()
+    for hook in fged_hooks:
+        hook.remove()
     ce_after = probe_ce()
     ce = torch.stack((ce_before, ce_after))
     if dist.is_initialized():
@@ -233,6 +323,13 @@ def run_crim_smoke(engine, loader, train_iter, scheduler, writer, logger, args, 
         name: (value.detach().float() - parameter_before[name]).abs().max().item()
         for name, value in watched.items()
     }
+    if fged_watched:
+        observations["fged"]["parameter_gradient_abs_sum"] = {name: value.item() for name, value in fged_param_grad.items()}
+        observations["fged"]["tensor_gradient_abs_sum"] = {name: value.item() for name, value in fged_tensor_grad.items()}
+        observations["fged"]["parameter_max_abs_change"] = {
+            name: (value.detach().float()-fged_before[name]).abs().max().item()
+            for name, value in fged_watched.items()
+        }
     summaries = [None] * dist.get_world_size() if dist.is_initialized() else [None]
     if dist.is_initialized():
         dist.all_gather_object(summaries, observations)
@@ -247,35 +344,57 @@ def run_crim_smoke(engine, loader, train_iter, scheduler, writer, logger, args, 
             failures.append(f"rank {rank}: no new role parameter changed")
         if summary["roles_min_pair_distance"] <= 1e-6:
             failures.append(f"rank {rank}: role vectors collapsed")
+        if fged_watched:
+            diagnostics = summary["fged"]
+            if not all(value > 0 for value in diagnostics["parameter_gradient_abs_sum"].values()):
+                failures.append(f"rank {rank}: FGED parameters lost their gradients")
+            if not all(value > 0 for value in diagnostics["tensor_gradient_abs_sum"].values()):
+                failures.append(f"rank {rank}: FGED refinement cut a seed/affinity/part gradient")
+            for name in ("positive_affinity", "negative_affinity", "part_effect", "part_exclude", "point_seed", "energy_step"):
+                if diagnostics["parameter_max_abs_change"][name] <= 0:
+                    failures.append(f"rank {rank}: FGED {name} did not update")
+            if diagnostics["minimum_refinement_change"] <= 0:
+                failures.append(f"rank {rank}: energy decoder returned unchanged seeds")
+            for name in ("graph_positive_edges", "graph_negative_edges", "part_supervised_count"):
+                if summary["loss_sums"].get(name, 0) <= 0:
+                    failures.append(f"rank {rank}: no real supervision for {name}")
+            if args.graph_long_range > 0 and summary["loss_sums"].get("long_range_edge_count", 0) <= 0:
+                failures.append(f"rank {rank}: no valid within-part long-distance edges")
     contact_anchors = sum(summary["loss_sums"].get("contact_valid_anchors", 0) for summary in summaries)
     cf_pairs = sum(summary["loss_sums"].get("cf_valid_pairs", 0) for summary in summaries)
     if contact_anchors <= 0:
         failures.append("No legitimate same-task/different-image CONTACT anchors were trained")
     if args.cf_loss_weight > 0 and cf_pairs <= 0:
         failures.append("Counterfactual supervision was enabled but no legal pair contributed")
-    if ce[1] >= ce[0]:
+    if not torch.isfinite(ce).all():
+        failures.append("The fixed training-batch CE probe is non-finite")
+    if args.model_variant == "crim" and ce[1] >= ce[0]:
         failures.append("The fixed training-batch CE probe did not decrease")
-    if failures:
-        raise RuntimeError("CRIM smoke verification failed: " + "; ".join(failures))
     if args.local_rank == 0:
         result = {
-            "model_variant": "crim", "git_commit": metadata["git"]["head"],
+            "model_variant": args.model_variant, "git_commit": metadata["git"]["head"],
             "source_sha256": metadata["source_sha256"], "role_token_ids": args.role_token_ids,
             "vocab_size": len(tokenizer), "optimizer_steps": args.smoke_optimizer_steps,
             "effective_batch_size": args.batch_size * args.grad_accumulation_steps * len(summaries),
             "ce_probe_before": ce[0].item(), "ce_probe_after": ce[1].item(),
+            "ce_probe_decreased": bool((ce[1] < ce[0]).item()),
             "contact_valid_anchors": contact_anchors, "cf_valid_pairs": cf_pairs,
             "backward_completed": True, "optimizer_step_performed": True,
             "checkpoint_saved": False, "per_rank": summaries,
+            "training_batch_refinement_metrics": getattr(smoke_args, "refinement_metrics", []),
+            "verification_passed": not failures, "verification_failures": failures,
         }
         write_provenance(Path(args.log_dir) / "smoke_result.json", result)
-        logger.info("CRIM bounded verification passed: CE %.6f -> %.6f; CONTACT anchors=%s; CF pairs=%s", ce[0].item(), ce[1].item(), contact_anchors, cf_pairs)
+        if not failures:
+            logger.info("%s bounded verification passed: CE %.6f -> %.6f; CONTACT anchors=%s; CF pairs=%s", args.model_variant.upper(), ce[0].item(), ce[1].item(), contact_anchors, cf_pairs)
         writer.close()
         wandb.finish()
     model.inspect_roles = False
     if dist.is_initialized():
         dist.barrier(device_ids=[args.local_rank])
         dist.destroy_process_group()
+    if failures:
+        raise RuntimeError(f"{args.model_variant} smoke verification failed: " + "; ".join(failures))
 
 
 def main(args):
@@ -286,7 +405,7 @@ def main(args):
         if os.path.exists(os.path.join(resume, "latest")):
             args.resume = resume
     metadata = collect_provenance(args, Path(__file__).resolve().parent)
-    if args.model_variant in ("partfield", "crim"):
+    if args.model_variant in ("partfield", "crim", "crag3d"):
         from src.utils.partfield_cache import cache_manifest
         manifest = cache_manifest(args.partfield_cache_dir)
         feature_dim = manifest.get("feature_dim")
@@ -303,12 +422,6 @@ def main(args):
     if args.preflight:
         print(json.dumps(metadata, ensure_ascii=False, indent=2))
         return
-    if args.model_variant == "crag3d":
-        raise NotImplementedError(
-            "CRAG-3D requires the FGED stage before training; no fallback is allowed. "
-            "Use the explicit crim variant for the three-role/simple-head ablation."
-        )
-
     import torch
     metadata["runtime"] = {
         "torch_version": torch.__version__,
@@ -340,7 +453,7 @@ def main(args):
     from src.utils.utils import dict_to_cuda
 
     sampling_seed = args.seed
-    if args.model_variant == "crim" and sampling_seed is not None:
+    if args.model_variant in ("crim", "crag3d") and sampling_seed is not None:
         sampling_seed += args.local_rank
     seed = set_seed(sampling_seed)
     if args.local_rank == 0:
@@ -373,7 +486,7 @@ def main(args):
 
     # Create model
     processor_source = args.processor_dir or args.version
-    if args.model_variant == "crim" and args.resume:
+    if args.model_variant in ("crim", "crag3d") and args.resume:
         processor_source = args.processor_dir or os.path.join(args.resume, "processor")
         if not os.path.isfile(os.path.join(processor_source, "role_tokens.json")):
             raise FileNotFoundError("A CRIM resume requires its saved processor/role_tokens.json")
@@ -387,7 +500,7 @@ def main(args):
     )
     tokenizer = processor.tokenizer
     role_token_ids = None
-    if args.model_variant == "crim":
+    if args.model_variant in ("crim", "crag3d"):
         from src.utils.role_tokens import register_role_tokens, save_role_processor, validate_role_record
         role_token_ids = register_role_tokens(tokenizer)
         if args.resume or args.processor_dir:
@@ -429,6 +542,12 @@ def main(args):
         "role_loss_weight": args.role_loss_weight,
         "cf_loss_weight": args.cf_loss_weight,
         "cf_overlap_threshold": args.cf_overlap_threshold,
+        "part_loss_weight": args.part_loss_weight,
+        "graph_loss_weight": args.graph_loss_weight,
+        "aux_loss_weight": args.aux_loss_weight,
+        "graph_knn": args.graph_knn,
+        "graph_long_range": args.graph_long_range,
+        "energy_steps": args.energy_steps,
     }
 
     config = transformers.AutoConfig.from_pretrained(args.version)
@@ -436,6 +555,21 @@ def main(args):
     model = Hammer(config, **model_args).to(device)
     if args.local_rank == 0:
         logger.info(f"Model created with {sum(p.numel() for p in model.parameters())} total parameters")
+        if args.model_variant == "crag3d":
+            metadata["fged"] = {
+                "energy_steps": args.energy_steps,
+                "local_degree": args.graph_knn, "long_range_degree": args.graph_long_range,
+                "part_loss_weight": args.part_loss_weight, "graph_loss_weight": args.graph_loss_weight,
+                "aux_loss_weight": args.aux_loss_weight,
+                "initial_energy_coefficients": model.energy_decoder.coefficients().detach().cpu().tolist(),
+                "decoder": "FP32 sparse analytic projected gradient with a learned bounded step",
+                "edge_chunk_size": model.functional_graph.edge_chunk_size,
+                "positive_threshold": model.functional_losses.positive_threshold,
+                "negative_threshold": model.functional_losses.negative_threshold,
+                "distance_threshold": model.functional_losses.distance_threshold,
+                "partfield_similarity_threshold": model.functional_losses.similarity_threshold,
+            }
+            write_provenance(Path(args.log_dir) / "provenance.json", metadata)
 
     model.vlm.config.eos_token_id = tokenizer.eos_token_id
     model.vlm.config.bos_token_id = tokenizer.bos_token_id
@@ -469,12 +603,13 @@ def main(args):
         if any(x in n for x in ["lm_head", "embed_tokens", "text_hidden_fcs"]):
             if args.local_rank == 0: 
                 logger.info(f"Parameter {n} (shape {p.shape}) is trainable.")
-            p.requires_grad = args.model_variant == "crim" or args.ce_loss_weight != 0.0
+            p.requires_grad = args.model_variant in ("crim", "crag3d") or args.ce_loss_weight != 0.0
         if any(
             [
                 x in n
                 for x in [
-                    "projection", "point_backbone", "lift_to_3d", "afford_decoder", "partfield_adapter", "crim"
+                    "projection", "point_backbone", "lift_to_3d", "afford_decoder", "partfield_adapter", "crim",
+                    "functional_graph", "energy_decoder"
                 ]
             ]
         ):
@@ -524,7 +659,7 @@ def main(args):
     if args.local_rank == 0:
         logger.info(f"Training with {len(train_dataset)} examples.")
         logger.info(f"Validation with {len(val_dataset)} examples.")
-        if args.model_variant == "crim":
+        if args.model_variant in ("crim", "crag3d"):
             metadata["counterfactual"] = {
                 "enabled": args.cf_loss_weight > 0,
                 "index": args.cf_index_path or None,
@@ -641,7 +776,7 @@ def main(args):
         # A single-batch check exits early, so avoid leaving prefetched workers alive.
         train_loader.num_local_io_workers = 0
     train_iter = iter(train_loader)
-    if args.smoke_check and args.model_variant == "crim":
+    if args.smoke_check and args.model_variant in ("crim", "crag3d"):
         run_crim_smoke(model_engine, train_loader, train_iter, scheduler, writer, logger,
                        args, metadata, tokenizer)
         return
@@ -739,7 +874,7 @@ def main(args):
             torch.distributed.barrier()
             model_engine.save_checkpoint(save_dir)
             if args.local_rank == 0:
-                if args.model_variant == "crim":
+                if args.model_variant in ("crim", "crag3d"):
                     save_role_processor(processor, Path(save_dir) / "processor", args.version)
                 logger.info(f"Checkpoint saved to {save_dir}")
 
