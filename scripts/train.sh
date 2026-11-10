@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Usage: bash scripts/train.sh -d PIADv1 -p Seen -g 4 -b 64 -l 0.0001 -e 30 -n exp1 [-m hammer|partfield|crag3d] [-c CACHE] [-P|-s] [-- train.py args]
+# Usage: bash scripts/train.sh -d PIADv1 -p Seen -g 4 -b 64 [-u MICRO_BATCH] -n exp1 [-m hammer|partfield|crim|crag3d] [-c CACHE] [-P|-s] [-- train.py args]
 
 # Set the used cuda path; maybe unnecessary
 export PATH=$HOME/local/cuda-11.8/bin:$PATH
@@ -27,7 +27,7 @@ PARTFIELD_CACHE_DIR=""
 PREFLIGHT=0
 SMOKE_CHECK=0
 
-while getopts ":d:p:g:b:l:e:n:m:c:Psh" opt; do
+while getopts ":d:p:g:b:u:l:e:n:m:c:Psh" opt; do
   case $opt in
     d)
       DATASET=$OPTARG
@@ -40,6 +40,9 @@ while getopts ":d:p:g:b:l:e:n:m:c:Psh" opt; do
       ;;
     b)
       GLOBAL_BATCH_SIZE=$OPTARG
+      ;;
+    u)
+      BATCH_SIZE_PER_DEVICE=$OPTARG
       ;;
     l)
       LR=$OPTARG
@@ -63,8 +66,8 @@ while getopts ":d:p:g:b:l:e:n:m:c:Psh" opt; do
       SMOKE_CHECK=1
       ;;
     h)
-      echo "Usage: $0 -d DATASET -p SETTING -g GPUS -b GLOBAL_BATCH -l LR -e EPOCHS -n NAME [-m hammer|partfield|crag3d] [-c CACHE] [-P|-s] [-- train.py args]"
-      echo "-P: source/data preflight only; -s: one real training batch forward/backward"
+      echo "Usage: $0 -d DATASET -p SETTING -g GPUS -b GLOBAL_BATCH [-u MICRO_BATCH] -l LR -e EPOCHS -n NAME [-m hammer|partfield|crim|crag3d] [-c CACHE] [-P|-s] [-- train.py args]"
+      echo "-P: source/data preflight; -s: single batch, or bounded CRIM optimizer/gradient verification"
       exit 0
       ;;
     :)
@@ -79,7 +82,7 @@ while getopts ":d:p:g:b:l:e:n:m:c:Psh" opt; do
 done
 shift $((OPTIND - 1))
 
-for value in "$NUM_DEVICES" "$GLOBAL_BATCH_SIZE" "$EPOCHS"; do
+for value in "$NUM_DEVICES" "$GLOBAL_BATCH_SIZE" "$BATCH_SIZE_PER_DEVICE" "$EPOCHS"; do
     if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
         echo "GPU count, global batch size and epochs must be positive integers" >&2
         exit 2
@@ -90,7 +93,7 @@ if (( GLOBAL_BATCH_SIZE % (BATCH_SIZE_PER_DEVICE * NUM_DEVICES) != 0 )); then
     exit 2
 fi
 case "$MODEL_VARIANT" in
-    hammer|partfield|crag3d) ;;
+    hammer|partfield|crim|crag3d) ;;
     *) echo "Unknown model variant: $MODEL_VARIANT" >&2; exit 2 ;;
 esac
 case "$DATASET/$SETTING" in

@@ -3,6 +3,7 @@ import sys
 import shutil
 import argparse
 import json
+import copy
 from pathlib import Path
 from functools import partial
 
@@ -70,12 +71,17 @@ def parse_args(args):
     parser.add_argument("--lr", default=0.0005, type=float)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--mask_loss_weight", default=2.0, type=float)
-    parser.add_argument("--model_variant", default="hammer", choices=["hammer", "partfield", "crag3d"])
+    parser.add_argument("--model_variant", default="hammer", choices=["hammer", "partfield", "crim", "crag3d"])
     parser.add_argument("--partfield_cache_dir", default="", type=str)
     parser.add_argument("--role_loss_weight", default=1.0, type=float)
     parser.add_argument("--graph_loss_weight", default=0.1, type=float)
     parser.add_argument("--cf_loss_weight", default=0.0, type=float)
     parser.add_argument("--energy_steps", default=5, type=int)
+    parser.add_argument("--cf_index_path", default="", type=str)
+    parser.add_argument("--cf_overlap_threshold", default=0.7, type=float)
+    parser.add_argument("--processor_dir", default="", type=str, help="Saved CRIM processor/tokenizer directory")
+    parser.add_argument("--smoke_optimizer_steps", default=3, type=int, help="Bounded CRIM smoke updates using the original trainer and accumulation")
+    parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--lora_alpha", default=32, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
     parser.add_argument("--lora_target_modules", default="q_proj, v_proj", type=str)
@@ -108,16 +114,179 @@ def parse_args(args):
     args.log_base_dir = str(Path(args.log_base_dir).expanduser().resolve())
     if args.partfield_cache_dir:
         args.partfield_cache_dir = str(Path(args.partfield_cache_dir).expanduser().resolve())
-    if args.model_variant == "partfield" and not args.partfield_cache_dir:
-        parser.error("--model_variant partfield requires --partfield_cache_dir")
+    if args.model_variant in ("partfield", "crim") and not args.partfield_cache_dir:
+        parser.error(f"--model_variant {args.model_variant} requires --partfield_cache_dir")
+    if not 0 < args.cf_overlap_threshold < 1:
+        parser.error("cf_overlap_threshold must be in (0,1)")
+    if args.smoke_optimizer_steps < 2:
+        parser.error("smoke_optimizer_steps must be at least two because the original warmup starts at zero LR")
+    if args.cf_loss_weight > 0:
+        if args.model_variant != "crim" or not args.cf_index_path:
+            parser.error("Counterfactual supervision requires --model_variant crim and --cf_index_path")
+        if args.batch_size < 2 or args.batch_size % 2:
+            parser.error("Counterfactual pairs require an even local --batch_size >= 2; preserve global batch via accumulation")
+    elif args.cf_index_path:
+        parser.error("--cf_index_path requires a positive --cf_loss_weight")
+    for name in ("processor_dir", "cf_index_path", "resume"):
+        if getattr(args, name):
+            setattr(args, name, str(Path(getattr(args, name)).expanduser().resolve()))
     return args
+
+
+def run_crim_smoke(engine, loader, train_iter, scheduler, writer, logger, args, metadata, tokenizer):
+    """Verify a few real optimizer updates through the unchanged HAMMER trainer."""
+    from itertools import chain
+    import torch
+    import torch.distributed as dist
+    import wandb
+    from tools.trainer import train
+    from src.utils.utils import dict_to_cuda
+
+    if args.role_loss_weight <= 0:
+        raise ValueError("CRIM smoke verification requires enabled role supervision")
+    model = engine.module
+    model.inspect_roles = True
+    device = next(model.parameters()).device
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.precision]
+    role_ids = torch.tensor([args.role_token_ids[name] for name in ("contact", "effect", "exclude")], device=device)
+    embedding = model.vlm.get_input_embeddings().weight
+    if not embedding.requires_grad:
+        raise RuntimeError("Role token embeddings were frozen after PEFT wrapping")
+    token_before = embedding.detach().index_select(0, role_ids).float().clone()
+    watched = {name: model.crim.role_projections[name][0].weight for name in args.role_token_ids}
+    parameter_before = {name: value.detach().float().clone() for name, value in watched.items()}
+    token_grad = torch.zeros(3, device=device)
+    role_grad = torch.zeros(3, device=device)
+    observations = {"microbatches": 0, "loss_sums": {}, "roles_min_pair_distance": float("inf")}
+
+    def token_hook(grad):
+        selected = grad.detach().index_select(0, role_ids).float()
+        if not torch.isfinite(selected).all():
+            raise RuntimeError("Non-finite role token embedding gradients")
+        token_grad.add_(selected.abs().sum(-1))
+
+    def role_hook(grad):
+        if not torch.isfinite(grad).all():
+            raise RuntimeError("Non-finite role feature gradients")
+        role_grad.add_(grad.detach().float().abs().sum((0, 2)))
+
+    def observe(module, inputs, output):
+        if not module.training:
+            return
+        required = ("loss", "ce_loss", "ca_loss", "role_loss", "effect_loss", "exclude_loss", "contact_loss")
+        for name in required:
+            if name not in output or not torch.isfinite(output[name]).all():
+                raise RuntimeError(f"Missing/non-finite CRIM smoke output: {name}")
+        if not output["adapter_features_finite"].item():
+            raise RuntimeError("Non-finite PartField adapter features")
+        roles = output["role_features"]
+        if roles.shape[1:] != (3, 512):
+            raise RuntimeError("Role feature shape is not [B,3,512]")
+        roles.register_hook(role_hook)
+        distances = torch.stack([(roles[:, a] - roles[:, b]).norm(dim=-1)
+                                 for a, b in ((0, 1), (0, 2), (1, 2))])
+        observations["roles_min_pair_distance"] = min(observations["roles_min_pair_distance"], distances.detach().min().item())
+        observations["microbatches"] += 1
+        for name, value in output.items():
+            if isinstance(value, torch.Tensor) and value.ndim == 0:
+                observations["loss_sums"][name] = observations["loss_sums"].get(name, 0.) + value.detach().item()
+        observations["pred_afford_shape"] = list(output["pred_afford"].shape)
+        observations["adapter_shapes"] = output["adapter_shapes"]
+        observations["image_token_counts"] = output["image_token_counts"].detach().cpu().tolist()
+        if not torch.allclose(output["contact_attention"].sum(-1), torch.ones(len(roles), device=device), atol=1e-5):
+            raise RuntimeError("CONTACT attention does not normalize over actual image tokens")
+
+    raw_probe = next(train_iter)
+    probe = dict_to_cuda(dict(raw_probe))
+
+    def probe_ce():
+        engine.eval()
+        queue_count = model.crim_losses.queue_count.clone()
+        with torch.no_grad(), torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
+            output = engine(**probe)
+            value = output["ce_loss"].float().detach()
+        if not torch.equal(queue_count, model.crim_losses.queue_count):
+            raise RuntimeError("Evaluation data changed the training-only CONTACT queue")
+        return value
+
+    ce_before = probe_ce()
+    embedding_hook = embedding.register_hook(token_hook)
+    output_hook = model.register_forward_hook(observe)
+    smoke_args = copy.copy(args)
+    smoke_args.steps_per_epoch = args.smoke_optimizer_steps
+    smoke_args.print_freq = 1
+    # Put the already-drawn batch back into the same stream after the CE probe.
+    train_iter, _ = train(loader, engine, 0, scheduler, writer, chain([raw_probe], train_iter), smoke_args, logger)
+    embedding_hook.remove()
+    output_hook.remove()
+    ce_after = probe_ce()
+    ce = torch.stack((ce_before, ce_after))
+    if dist.is_initialized():
+        dist.all_reduce(ce)
+        ce /= dist.get_world_size()
+    observations["role_feature_gradient_abs_sum"] = role_grad.cpu().tolist()
+    observations["token_embedding_gradient_abs_sum"] = token_grad.cpu().tolist()
+    observations["token_embedding_max_abs_change"] = (
+        embedding.detach().index_select(0, role_ids).float() - token_before
+    ).abs().amax(-1).cpu().tolist()
+    observations["role_parameter_max_abs_change"] = {
+        name: (value.detach().float() - parameter_before[name]).abs().max().item()
+        for name, value in watched.items()
+    }
+    summaries = [None] * dist.get_world_size() if dist.is_initialized() else [None]
+    if dist.is_initialized():
+        dist.all_gather_object(summaries, observations)
+    else:
+        summaries[0] = observations
+    failures = []
+    for rank, summary in enumerate(summaries):
+        for field in ("role_feature_gradient_abs_sum", "token_embedding_gradient_abs_sum", "token_embedding_max_abs_change"):
+            if not all(value > 0 for value in summary[field]):
+                failures.append(f"rank {rank}: missing gradient/update in {field}")
+        if not any(value > 0 for value in summary["role_parameter_max_abs_change"].values()):
+            failures.append(f"rank {rank}: no new role parameter changed")
+        if summary["roles_min_pair_distance"] <= 1e-6:
+            failures.append(f"rank {rank}: role vectors collapsed")
+    contact_anchors = sum(summary["loss_sums"].get("contact_valid_anchors", 0) for summary in summaries)
+    cf_pairs = sum(summary["loss_sums"].get("cf_valid_pairs", 0) for summary in summaries)
+    if contact_anchors <= 0:
+        failures.append("No legitimate same-task/different-image CONTACT anchors were trained")
+    if args.cf_loss_weight > 0 and cf_pairs <= 0:
+        failures.append("Counterfactual supervision was enabled but no legal pair contributed")
+    if ce[1] >= ce[0]:
+        failures.append("The fixed training-batch CE probe did not decrease")
+    if failures:
+        raise RuntimeError("CRIM smoke verification failed: " + "; ".join(failures))
+    if args.local_rank == 0:
+        result = {
+            "model_variant": "crim", "git_commit": metadata["git"]["head"],
+            "source_sha256": metadata["source_sha256"], "role_token_ids": args.role_token_ids,
+            "vocab_size": len(tokenizer), "optimizer_steps": args.smoke_optimizer_steps,
+            "effective_batch_size": args.batch_size * args.grad_accumulation_steps * len(summaries),
+            "ce_probe_before": ce[0].item(), "ce_probe_after": ce[1].item(),
+            "contact_valid_anchors": contact_anchors, "cf_valid_pairs": cf_pairs,
+            "backward_completed": True, "optimizer_step_performed": True,
+            "checkpoint_saved": False, "per_rank": summaries,
+        }
+        write_provenance(Path(args.log_dir) / "smoke_result.json", result)
+        logger.info("CRIM bounded verification passed: CE %.6f -> %.6f; CONTACT anchors=%s; CF pairs=%s", ce[0].item(), ce[1].item(), contact_anchors, cf_pairs)
+        writer.close()
+        wandb.finish()
+    model.inspect_roles = False
+    if dist.is_initialized():
+        dist.barrier(device_ids=[args.local_rank])
+        dist.destroy_process_group()
 
 
 def main(args):
     args = parse_args(args)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
+    if args.auto_resume and not args.resume:
+        resume = os.path.join(args.log_dir, "model")
+        if os.path.exists(os.path.join(resume, "latest")):
+            args.resume = resume
     metadata = collect_provenance(args, Path(__file__).resolve().parent)
-    if args.model_variant == "partfield":
+    if args.model_variant in ("partfield", "crim"):
         from src.utils.partfield_cache import cache_manifest
         manifest = cache_manifest(args.partfield_cache_dir)
         feature_dim = manifest.get("feature_dim")
@@ -136,8 +305,8 @@ def main(args):
         return
     if args.model_variant == "crag3d":
         raise NotImplementedError(
-            "CRAG-3D requires the CRIM/FGED stages before training; no fallback is allowed. "
-            "The explicit partfield variant is the single-token/simple-head ablation."
+            "CRAG-3D requires the FGED stage before training; no fallback is allowed. "
+            "Use the explicit crim variant for the three-role/simple-head ablation."
         )
 
     import torch
@@ -170,7 +339,10 @@ def main(args):
     from src.utils.afford_dataset import PIADv1Afford, PIADAfford, collate_fn
     from src.utils.utils import dict_to_cuda
 
-    seed = set_seed(args.seed)
+    sampling_seed = args.seed
+    if args.model_variant == "crim" and sampling_seed is not None:
+        sampling_seed += args.local_rank
+    seed = set_seed(sampling_seed)
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
@@ -200,8 +372,13 @@ def main(args):
     args.distributed = world_size > 1
 
     # Create model
+    processor_source = args.processor_dir or args.version
+    if args.model_variant == "crim" and args.resume:
+        processor_source = args.processor_dir or os.path.join(args.resume, "processor")
+        if not os.path.isfile(os.path.join(processor_source, "role_tokens.json")):
+            raise FileNotFoundError("A CRIM resume requires its saved processor/role_tokens.json")
     processor = transformers.AutoProcessor.from_pretrained(
-        args.version,
+        processor_source,
         model_max_length=args.model_max_length,
         padding_side="right",
         use_fast=True,
@@ -209,8 +386,27 @@ def main(args):
         max_pixels=args.max_pixels
     )
     tokenizer = processor.tokenizer
-    num_added_tokens = tokenizer.add_tokens("[CONT]")
-    args.cont_token_idx = tokenizer("[CONT]", add_special_tokens=False).input_ids[0]
+    role_token_ids = None
+    if args.model_variant == "crim":
+        from src.utils.role_tokens import register_role_tokens, save_role_processor, validate_role_record
+        role_token_ids = register_role_tokens(tokenizer)
+        if args.resume or args.processor_dir:
+            record_path = Path(processor_source) / "role_tokens.json"
+            validate_role_record(tokenizer, json.loads(record_path.read_text()), args.version)
+        args.cont_token_idx = None
+        args.role_token_ids = role_token_ids
+        if args.local_rank == 0:
+            saved_processor_dir = Path(args.log_dir) / "processor"
+            role_record = save_role_processor(processor, saved_processor_dir, args.version)
+            reloaded = transformers.AutoProcessor.from_pretrained(saved_processor_dir, local_files_only=True)
+            validate_role_record(reloaded.tokenizer, role_record, args.version)
+            metadata["roles"] = dict(role_record, processor_dir=str(saved_processor_dir), roundtrip_verified=True)
+            metadata["sampling_seed_policy"] = "base seed + local rank; DeepSpeed broadcasts initial model parameters"
+            write_provenance(Path(args.log_dir) / "provenance.json", metadata)
+            logger.info("CRIM token IDs: %s; vocabulary size: %s; saved processor roundtrip passed", role_token_ids, len(tokenizer))
+    else:
+        tokenizer.add_tokens("[CONT]")
+        args.cont_token_idx = tokenizer("[CONT]", add_special_tokens=False).input_ids[0]
 
     torch_dtype = torch.float32
     if args.precision == "bf16":
@@ -229,6 +425,10 @@ def main(args):
         "point_N_p": 64,
         "model_variant": args.model_variant,
         "partfield_feature_dim": getattr(args, "partfield_feature_dim", None),
+        "role_token_ids": role_token_ids,
+        "role_loss_weight": args.role_loss_weight,
+        "cf_loss_weight": args.cf_loss_weight,
+        "cf_overlap_threshold": args.cf_overlap_threshold,
     }
 
     config = transformers.AutoConfig.from_pretrained(args.version)
@@ -242,6 +442,8 @@ def main(args):
     model.vlm.config.pad_token_id = tokenizer.pad_token_id
 
     model.vlm.enable_input_require_grads()
+    if args.gradient_checkpointing:
+        model.vlm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     for p in model.vlm.visual.parameters():
         p.requires_grad = False
 
@@ -267,12 +469,12 @@ def main(args):
         if any(x in n for x in ["lm_head", "embed_tokens", "text_hidden_fcs"]):
             if args.local_rank == 0: 
                 logger.info(f"Parameter {n} (shape {p.shape}) is trainable.")
-            p.requires_grad = not (args.ce_loss_weight == 0.0)
+            p.requires_grad = args.model_variant == "crim" or args.ce_loss_weight != 0.0
         if any(
             [
                 x in n
                 for x in [
-                    "projection", "point_backbone", "lift_to_3d", "afford_decoder", "partfield_adapter"
+                    "projection", "point_backbone", "lift_to_3d", "afford_decoder", "partfield_adapter", "crim"
                 ]
             ]
         ):
@@ -304,7 +506,10 @@ def main(args):
         question_type=args.question_type,
         model_variant=args.model_variant,
         partfield_cache_dir=args.partfield_cache_dir,
+        cf_index_path=args.cf_index_path,
     )
+    if args.cf_loss_weight > 0 and train_dataset.cf_overlap_threshold != args.cf_overlap_threshold:
+        raise ValueError("Counterfactual loss overlap threshold must match its train-only index")
 
     val_dataset = DatasetClass(
         datasets="piad",
@@ -319,6 +524,16 @@ def main(args):
     if args.local_rank == 0:
         logger.info(f"Training with {len(train_dataset)} examples.")
         logger.info(f"Validation with {len(val_dataset)} examples.")
+        if args.model_variant == "crim":
+            metadata["counterfactual"] = {
+                "enabled": args.cf_loss_weight > 0,
+                "index": args.cf_index_path or None,
+                "valid_pairs": len(train_dataset.cf_pairs),
+                "loss_weight": args.cf_loss_weight,
+                "overlap_threshold": args.cf_overlap_threshold,
+                "statistics": getattr(train_dataset, "cf_statistics", None),
+            }
+            write_provenance(Path(args.log_dir) / "provenance.json", metadata)
 
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
@@ -373,15 +588,10 @@ def main(args):
             tokenizer=tokenizer,
             processor=processor,
             model_name="qwen_vl",
+            role_token_ids=role_token_ids,
         ),
         config=ds_config,
     )
-
-    # resume deepspeed checkpoint
-    if args.auto_resume and len(args.resume) == 0:
-        resume = os.path.join(args.log_dir, "model")
-        if os.path.exists(resume):
-            args.resume = resume
 
     if args.resume:
         if args.local_rank == 0:
@@ -422,6 +632,7 @@ def main(args):
             tokenizer=tokenizer,
             processor=processor,
             model_name="qwen_vl",
+            role_token_ids=role_token_ids,
         ),
     )
     
@@ -430,6 +641,10 @@ def main(args):
         # A single-batch check exits early, so avoid leaving prefetched workers alive.
         train_loader.num_local_io_workers = 0
     train_iter = iter(train_loader)
+    if args.smoke_check and args.model_variant == "crim":
+        run_crim_smoke(model_engine, train_loader, train_iter, scheduler, writer, logger,
+                       args, metadata, tokenizer)
+        return
     if args.smoke_check:
         model_engine.train()
         input_dict = dict_to_cuda(next(train_iter))
@@ -524,6 +739,8 @@ def main(args):
             torch.distributed.barrier()
             model_engine.save_checkpoint(save_dir)
             if args.local_rank == 0:
+                if args.model_variant == "crim":
+                    save_role_processor(processor, Path(save_dir) / "processor", args.version)
                 logger.info(f"Checkpoint saved to {save_dir}")
 
     if args.local_rank == 0:

@@ -17,6 +17,9 @@ from src.models.point_model.pointnet2 import (
 )
 from src.models.decoder.transformer import CrossAttnBlock
 from src.models.crag.partfield_adapter import PartFieldAdapter
+from src.models.crag.role_interaction import RoleInteraction
+from src.models.crag.crag_losses import CRIMLoss
+from src.models.crag.counterfactual import counterfactual_loss
     
 
 class SwapAxes(nn.Module):
@@ -188,7 +191,7 @@ class SegModel(nn.Module):
         point_embd_dim = kwargs.get("point_embd_dim", 512)
         point_N_p = kwargs.pop("point_N_p", 64)
         point_normal_channel = kwargs.pop("point_normal_channel", False)
-        if kwargs.get("model_variant", "hammer") == "partfield":
+        if kwargs.get("model_variant", "hammer") in ("partfield", "crim"):
             feature_dim = kwargs.get("partfield_feature_dim")
             if not isinstance(feature_dim, int) or isinstance(feature_dim, bool) or feature_dim < 1:
                 raise ValueError("PartField feature_dim must be a positive integer from the cache manifest")
@@ -214,6 +217,9 @@ class SegModel(nn.Module):
             downsample_rate=8
         )
 
+        if kwargs.get("model_variant") == "crim":
+            return  # CRIM owns its three independent hidden-state projections.
+
         # Projection layer for text embeddings
         in_dim = config.hidden_size
         vlm_out_dim = kwargs["vlm_out_dim"]
@@ -233,12 +239,12 @@ class Hammer(nn.Module):
     def __init__(self, config, **kwargs):
         super(Hammer, self).__init__()
         self.model_variant = kwargs.pop("model_variant", "hammer")
-        if self.model_variant not in ("hammer", "partfield"):
+        if self.model_variant not in ("hammer", "partfield", "crim"):
             raise NotImplementedError(
                 f"Model variant {self.model_variant!r} requires the CRIM/FGED stages; refusing to use another variant as a fallback."
             )
         kwargs["model_variant"] = self.model_variant
-        self.cont_token_idx = kwargs.pop("cont_token_idx")
+        self.cont_token_idx = kwargs.pop("cont_token_idx", None)
         vlm_out_dim = kwargs["vlm_out_dim"]
         point_embd_dim = kwargs.get("point_embd_dim", 512)
         point_normal_channel = kwargs.pop("point_normal_channel", False)
@@ -255,12 +261,21 @@ class Hammer(nn.Module):
         )
         self.seg_model = SegModel(config, **kwargs)
 
-        self.projection = nn.Sequential(
-            nn.Linear(vlm_out_dim, point_embd_dim),   
-            nn.ReLU(),
-            nn.Linear(point_embd_dim, point_embd_dim),
-            nn.ReLU()
-        )
+        if self.model_variant == "crim":
+            self.role_token_ids = kwargs["role_token_ids"]
+            self.image_token_id = config.image_token_id
+            self.crim = RoleInteraction(config.hidden_size, point_embd_dim)
+            self.crim_losses = CRIMLoss(embedding_dim=point_embd_dim)
+            self.role_loss_weight = kwargs.get("role_loss_weight", 1.0)
+            self.cf_loss_weight = kwargs.get("cf_loss_weight", 0.0)
+            self.cf_overlap_threshold = kwargs.get("cf_overlap_threshold", 0.7)
+        else:
+            self.projection = nn.Sequential(
+                nn.Linear(vlm_out_dim, point_embd_dim),
+                nn.ReLU(),
+                nn.Linear(point_embd_dim, point_embd_dim),
+                nn.ReLU()
+            )
         
         self.ce_loss_weight = kwargs.pop("ce_loss_weight", 0)
         self.mask_loss_weight = kwargs.pop("mask_loss_weight", 0)
@@ -294,11 +309,16 @@ class Hammer(nn.Module):
         inference: bool = False,
         partfield_features: torch.FloatTensor = None,
         partfield_part_ids: torch.LongTensor = None,
+        affordance_ids: torch.LongTensor = None,
+        image_ids: torch.LongTensor = None,
+        point_canonical_indices: torch.LongTensor = None,
+        point_key=None,
+        inspect_roles: bool = False,
         **kwargs
     ):
         B = points.shape[0]
         assert B == len(offset) - 1, "Batch size mismatch with offset length"
-        if self.model_variant == "partfield" and (
+        if self.model_variant in ("partfield", "crim") and (
             partfield_features is None or partfield_part_ids is None
         ):
             raise ValueError("PartField mode requires frozen feature/part-ID caches for every sample")
@@ -313,6 +333,13 @@ class Hammer(nn.Module):
             output_hidden_states=True,
         )
         output_hidden_states = output.hidden_states[-1]
+        if self.model_variant == "crim":
+            return self.crim_forward(
+                output, output_hidden_states, input_ids, labels, attention_masks,
+                offset, points, gt_affords, partfield_features, partfield_part_ids,
+                affordance_ids, image_ids, point_canonical_indices, point_key,
+                inference, inspect_roles,
+            )
         cont_token_mask = input_ids == self.cont_token_idx
 
         hidden_states = []
@@ -360,5 +387,44 @@ class Hammer(nn.Module):
             result["adapter_features_finite"] = torch.stack([
                 torch.isfinite(features).all() for features in point_embeddings
             ]).all()
+        return result
+
+    def crim_forward(self, output, hidden_states, input_ids, labels, attention_masks,
+                     offset, points, gt_affords, features, part_ids, affordance_ids,
+                     image_ids, canonical_indices, point_keys, inference, inspect_roles):
+        if affordance_ids is None or image_ids is None:
+            raise ValueError("CRIM requires actual affordance and image identities")
+        inspect_roles = inspect_roles or getattr(self, "inspect_roles", False)
+        self.crim.capture_gradients = inspect_roles
+        encoded = self.seg_model.partfield_adapter(points, features, part_ids)
+        role_output = self.crim(hidden_states, input_ids, attention_masks, labels,
+                                offset, self.role_token_ids, self.image_token_id)
+        roles = role_output["roles"]
+        lifted = self.seg_model.lift_to_3d(roles, encoded["multi_scale_features"])
+        pred_afford = self.seg_model.afford_decoder(encoded["point_features"], lifted)
+        loss_ce = output.loss * self.ce_loss_weight
+        loss_ca = ca_loss(pred_afford, gt_affords) * self.mask_loss_weight
+        losses = self.crim_losses(
+            roles, encoded["point_features"], encoded["prototypes"], part_ids,
+            encoded["part_mask"], points, gt_affords, affordance_ids, image_ids,
+            update_queue=not inference,
+        )
+        result = dict(losses, ce_loss=loss_ce, ca_loss=loss_ca, pred_afford=pred_afford)
+        result["loss"] = loss_ce + loss_ca + self.role_loss_weight * losses["role_loss"]
+        if self.cf_loss_weight > 0 and self.training and not inference:
+            if canonical_indices is None or point_keys is None:
+                raise ValueError("Counterfactual supervision requires original-to-canonical indices and point identities")
+            cf = counterfactual_loss(pred_afford, gt_affords, point_keys, affordance_ids,
+                                     canonical_indices, overlap_threshold=self.cf_overlap_threshold)
+            result.update(cf)
+            result["loss"] = result["loss"] + self.cf_loss_weight * cf["cf_loss"]
+        result["adapter_shapes"] = [list(value.shape) for value in encoded["multi_scale_features"]]
+        result["adapter_features_finite"] = torch.stack([
+            torch.isfinite(value).all() for value in encoded["multi_scale_features"]
+        ]).all()
+        if inspect_roles:
+            result["role_features"] = roles
+            result["contact_attention"] = role_output["contact_attention"]
+            result["image_token_counts"] = role_output["image_token_counts"]
         return result
 

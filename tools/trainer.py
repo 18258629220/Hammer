@@ -20,6 +20,12 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
     losses = AverageMeter("Loss", ":.4f")
     ce_losses = AverageMeter("CELoss", ":.4f")
     mask_losses = AverageMeter("MaskLoss", ":.4f")
+    extra_names = (
+        "role_loss", "cf_loss", "effect_loss", "exclude_loss", "contact_loss", "separation_loss",
+        "contact_valid_anchors", "contact_positive_pairs", "contact_negative_pairs",
+        "contact_queue_size", "hard_negative_count", "hard_negative_parts", "cf_valid_pairs",
+    ) if getattr(args, "model_variant", "hammer") == "crim" else ()
+    extra_meters = {name: AverageMeter(name, ":.4f") for name in extra_names}
 
     progress = ProgressMeter(
         args.steps_per_epoch,
@@ -41,7 +47,7 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
         for i in range(args.grad_accumulation_steps):
             try:
                 input_dict = next(train_iter)
-            except:
+            except StopIteration:
                 train_iter = iter(train_loader)
                 input_dict = next(train_iter)
 
@@ -58,6 +64,9 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
             losses.update(loss.item(), input_dict["points"].size(0))
             ce_losses.update(ce_loss.item(), input_dict["points"].size(0))
             mask_losses.update(mask_loss.item(), input_dict["points"].size(0))
+            for name, meter in extra_meters.items():
+                if name in output_dict:
+                    meter.update(output_dict[name].item(), input_dict["points"].size(0))
             model.backward(loss)
             model.step()
 
@@ -73,6 +82,9 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
                 losses.all_reduce()
                 ce_losses.all_reduce()
                 mask_losses.all_reduce()
+                for meter in extra_meters.values():
+                    if meter.count:
+                        meter.all_reduce()
 
             if args.local_rank == 0:
                 progress.display(global_step + 1)
@@ -89,12 +101,20 @@ def train(train_loader, model, epoch, scheduler, writer, train_iter, args, logge
                     "metrics/total_secs_per_batch": batch_time.avg,
                     "metrics/data_secs_per_batch": data_time.avg,
                 }, step=steps)
+                extra_log = {f"train/{name}": meter.avg for name, meter in extra_meters.items() if meter.count}
+                for name, value in extra_log.items():
+                    writer.add_scalar(name, value, steps)
+                if extra_log:
+                    wandb.log(extra_log, step=steps)
+                    logger.info("CRIM losses/counts: %s", extra_log)
 
             batch_time.reset()
             data_time.reset()
             losses.reset()
             ce_losses.reset()
             mask_losses.reset()
+            for meter in extra_meters.values():
+                meter.reset()
 
         if global_step != 0:
             curr_lr = scheduler.get_last_lr()

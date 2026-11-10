@@ -102,13 +102,14 @@ bash scripts/eval.sh
 `--model_variant hammer`（默认）的原模型、CE/CA 损失、DeepSpeed 配置和评测指标。
 HAMMER 基线固定为 `e8aa2e6f5c705d1e58f129e9426870877be03011`，可从该提交恢复原版。
 阶段 1 的真实单批前向/反向已通过。阶段 2 已完成全量离线缓存和模型接入，
-真实缓存的训练入口前向/反向检查已通过；后续 CRIM/FGED 尚未实现。
-选择 `crag3d` 训练会明确报错，避免误把 HAMMER 当作 CRAG-3D 运行。
+真实缓存的训练入口前向/反向检查已通过。阶段 3 的三角色 CRIM、训练集反事实监督
+和短程更新检查已完成；阶段 4 FGED 尚未实现，选择 `crag3d` 仍会明确报错。
 
-原 shell 支持 `-m hammer|partfield|crag3d`、`-c PARTFIELD_CACHE_DIR`，以及 `--` 后透传
+原 shell 支持 `-m hammer|partfield|crim|crag3d`、`-c PARTFIELD_CACHE_DIR`，以及 `--` 后透传
 `train.py` 参数。新增参数包括 `--role_loss_weight`、`--graph_loss_weight`、
-`--cf_loss_weight` 和 `--energy_steps`；当前仅记录这些算法参数。
-shell 仍使用四 GPU、全局 batch 64、30 epochs 的默认规格，并检查 batch 整除关系。
+`--cf_loss_weight` 和 `--energy_steps`；角色与 CF 权重已接入训练，图和能量参数留待阶段 4。
+shell 仍使用四 GPU、全局 batch 64、30 epochs 的默认规格；`-u` 设置每卡微批大小，
+默认仍为 1，并据此计算梯度累积、检查全局 batch 整除关系。
 LoRA 目标名称会去除首尾空格，确保默认 `q_proj, v_proj` 均能匹配。
 
 ```bash
@@ -131,11 +132,13 @@ PYTHON_BIN=/path/to/hammer/bin/python bash scripts/train.sh -d PIADv1 -p Seen -n
 数据清单哈希及行数、模型模式、参数和路径；模型启动时另记录 CUDA 可用性。
 恢复现有训练时使用新实验名称，并在 `--` 后传入 `--resume /absolute/checkpoint/path`。
 
-`-s` 检查使用真实 Dataset、collate、Qwen、LoRA 和 DeepSpeed ZeRO-2，读取一批后
+`hammer`、`partfield` 的 `-s` 检查使用真实 Dataset、collate、Qwen、LoRA 和 DeepSpeed ZeRO-2，读取一批后
 核对四个兼容输出键、有限数值及预测/GT 形状，并执行反向。所有 rank 完成后，
 rank 0 写入 `smoke_result.json`，记录损失、预测形状、GPU 映射、源码哈希及反向状态。
 该模式使用零个训练 DataLoader worker，并在退出前销毁分布式进程组；不执行
-optimizer step、不保存权重。正式训练仍保留原 DataLoader 和训练主循环。
+optimizer step、不保存权重。`crim` 的 `-s` 则通过原 trainer 执行有限个真实更新步骤，
+默认 `--smoke_optimizer_steps 3`，用于核对新 token 和角色参数的更新；同样不保存训练权重。
+正式训练仍保留原 DataLoader 和训练主循环。
 
 2026-11-09 的阶段 1 检查：Python/Bash 语法和原 shell 的 `-P` 预检通过，
 记录了五种 PIAD 划分的 24 份清单。最初的 CUDA 不可用来自沙箱设备访问限制；
@@ -239,9 +242,73 @@ PIADv2 Seen 的实际训练清单为 36,190 条；原 shell 仍按 37,120 设置
 四尺度尺寸为 `[1,64,512]`、`[1,128,512]`、`[1,512,512]`、`[1,2048,512]`，
 特征均为有限数值，预测形状为 `[1,2048,1]`；rank 0 总损失为 7.5574712753
 （CE 5.1187548637，CA 2.4387161732）。四个进程完成反向并正常退出，GPU 0–3 已释放。
-实验的 `smoke_result.json` 记录尺寸、有限值标记和源码哈希；当前源码与验证快照哈希一致。
+实验的 `smoke_result.json` 记录尺寸、有限值标记和源码哈希；该阶段提交时源码与验证快照哈希一致。
 本阶段未执行 optimizer step、完整训练、checkpoint 保存或独立指标评估。
-按用户要求在阶段 2 提交后停止，等待验收指令再进入阶段 3。
+
+### 阶段 3：三角色 CRIM 与训练集反事实监督
+
+`-m crim` 使用 PartField + CRIM + 原简单分割头，保留原 CE/CA 主损失和评测指标。
+回答由现有类别、任务字段自动拼接，恰好包含 `[CONTACT]`、`[EFFECT]`、`[EXCLUDE]`
+各一次；按精确 token ID 和 conversation offset 读取隐藏状态，保留 assistant CE 标签。
+CONTACT 对 HOI 图像 token 做注意力读取，EFFECT 对齐功能正负原型，EXCLUDE 监督
+当前任务的困难负点和部件，另加温和的角色分离约束。原数据没有人工接触点标注，
+这些角色不被解释为手部接触真值；本阶段未启用 SAM3。
+
+CONTACT 使用跨 rank 可导的当前特征和持久化 FIFO 队列（容量 512）做任务对比。
+图像身份根据已读取的 RGB 尺寸和像素内容计算，同一图片的跨路径副本不会被当作新正样本。
+仅训练特征入队；没有合法正对的启动批次明确记录有效数为 0。预测路径不读取 GT 热力图。
+新增损失及有效样本计数接入原日志；trainer 的数据迭代仅捕获 `StopIteration`，
+避免掩盖真实数据错误，自动恢复也只接受存在 `latest` 的 checkpoint 目录。
+
+CF 索引只读取所选训练清单及其标签，按实际 XYZ 身份、物体和任务选择首个无歧义代表，
+以规范点序对齐标签；排除空 GT、重复坐标标签歧义及 min/max 软 IoU 不低于 0.7 的配对。
+训练时以 product 软 IoU 做自身 GT 与另一任务 GT 的 margin ranking。已生成的合法配对数为：
+
+| 训练划分 | 合法 CF 配对 |
+| --- | ---: |
+| PIADv1 Seen | 8,154 |
+| PIADv1 Unseen | 8,038 |
+| PIADv2 Seen | 7,596 |
+| PIADv2 Unseen_obj | 8,057 |
+| PIADv2 Unseen_afford | 6,288 |
+
+```bash
+# 按选定划分生成训练集索引；输出和标签数据均不提交 Git。
+/home/hzl/miniconda3/envs/hammer/bin/python tools/build_cf_index.py \
+  --dataset PIADv1 --setting Seen --output data/cf_index/PIADv1_Seen.json \
+  --partfield_cache_dir "$PWD/data/partfield_cache"
+
+# 先在沙箱外确认 GPU 0–3 空闲；使用新的 -n 名称重新检查。
+nvidia-smi
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+PYTHON_BIN=/home/hzl/miniconda3/envs/hammer/bin/python \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+bash scripts/train.sh -d PIADv1 -p Seen -m crim \
+  -c "$PWD/data/partfield_cache" -g 4 -b 64 -u 2 -n crag_stage3_crim_verified -s \
+  -- --workers 0 --seed 3407 --cf_loss_weight 0.1 \
+  --cf_index_path "$PWD/data/cf_index/PIADv1_Seen.json" \
+  --smoke_optimizer_steps 3 --gradient_checkpointing
+```
+
+CF 默认权重为 0，保留原采样；启用正 CF 权重和索引时要求偶数微批且至少为 2。
+配对通过原 DataLoader 的 `Dataset.__getitems__` 取得，图像继续在原物体/任务范围内随机配对，
+不把验证或测试标签混入训练。上述设置为每卡微批 2、累积 8、四卡，全局 batch 仍为 64。
+
+2026-11-10 的实际运行通过原 trainer 完成 3 个 optimizer steps；原 warmup 首步 LR 为 0，
+因此使用多个更新步骤检查参数变化，没有运行完整 epoch。三个 token ID 为
+`151665/151666/151667`（CONTACT/EFFECT/EXCLUDE），词表大小为 151,668；
+processor 保存、`role_tokens.json` 词表 SHA256 及本地重新加载校验均通过。
+所有 rank 的三个 token 行和三个角色头均有实际更新，最大变化均为 `1.9073486328125e-6`；
+每个样本的角色特征为 `[3,512]`，均有梯度，角色间最小距离大于 31.23。
+预测形状为 `[2,2048,1]`，adapter 尺寸为 `[2,64,512]`、`[2,128,512]`、
+`[2,512,512]`、`[2,2048,512]`，当前源码 SHA256 与验证快照及 provenance 一致。
+固定训练批次的 eval CE 从
+`6.4615869522` 降至 `6.4582962990`，累计有 180 个合法 CONTACT anchors、96 个合法 CF 配对。
+四个 rank 正常退出，GPU 0–3 已释放，细节记录在该实验的 `smoke_result.json`。
+
+代码在训练保存 CRIM checkpoint 时同步保存 processor，恢复时校验 token 合同；
+本次只验证了 tokenizer 往返保存及真实参数更新，未产出或恢复完整 CRIM 训练 checkpoint，
+未报告长期收敛结果或新的评测精度。阶段 3 提交后停止，等待验收指令再进入阶段 4。
 
 ## :books: License
 This repository is released under the [MIT license](LICENSE).

@@ -53,6 +53,27 @@ OAFFORD_AFFORD_OBJ_ANSWER_LIST = [
 ]
 
 
+# These are automatic task templates, not annotated descriptions of contact,
+# functional regions, or excluded parts. The role losses supply supervision.
+CRAG_ROLE_ANSWER_LIST = [
+    (
+        "The interaction with the {class_name} demonstrates {affordance}. "
+        "Contact cue: [CONTACT]. Functional effect cue: [EFFECT]. "
+        "Excluded-region cue: [EXCLUDE]."
+    ),
+    (
+        "Affordance: {affordance}; object: {class_name}. "
+        "Contact evidence [CONTACT]; intended effect [EFFECT]; "
+        "irrelevant-part evidence [EXCLUDE]."
+    ),
+    (
+        "This {class_name} interaction suggests {affordance}. "
+        "Interaction cue [CONTACT], task effect [EFFECT], "
+        "and excluded-region evidence [EXCLUDE]."
+    ),
+]
+
+
 class Summary(Enum):
     NONE = 0
     AVERAGE = 1

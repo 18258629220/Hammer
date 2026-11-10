@@ -1,6 +1,7 @@
 import os
 import copy
 import random
+import hashlib
 from torch.utils.data import Dataset
 
 import numpy as np
@@ -12,9 +13,10 @@ from src.models.point_model.pointnet2 import pc_normalize
 from .utils import OAFFORD_QUESTION_LIST, OAFFORD_ANSWER_LIST
 from .utils import OAFFORD_AFFORD_QUESTION_LIST, OAFFORD_AFFORD_ANSWER_LIST
 from .utils import OAFFORD_AFFORD_OBJ_ANSWER_LIST
+from .utils import CRAG_ROLE_ANSWER_LIST
 
 from .conversation import get_default_conv_template
-from .partfield_cache import cache_manifest, load_partfield_cache
+from .partfield_cache import cache_manifest, canonical_points, load_partfield_cache
 
 
 AFFORD_LABEL = [
@@ -51,9 +53,12 @@ SEEN = [
     'Kettle', 'Surfboard', 'Mug', 'Spoon'
 ]
 
+ROLE_VARIANTS = ("crim", "crag3d")
+ROLE_METADATA_FIELDS = {"affordance_id", "image_id", "point_canonical_indices"}
+
 
 def _prepare_partfield_cache(model_variant, directory):
-    if model_variant not in ("hammer", "partfield", "crag3d"):
+    if model_variant not in ("hammer", "partfield", "crim", "crag3d"):
         raise ValueError(f"Unknown dataset model variant: {model_variant}")
     if model_variant == "hammer":
         return ""
@@ -64,8 +69,66 @@ def _prepare_partfield_cache(model_variant, directory):
     return directory
 
 
+def _role_metadata(cached, variant, raw_xyz, affordance, image):
+    if variant not in ROLE_VARIANTS:
+        return cached
+    if cached is None:
+        raise ValueError("Role supervision requires aligned PartField caches")
+    _, _, inverse = canonical_points(raw_xyz)
+    image_digest = hashlib.sha256()
+    image_digest.update(b"RGB\0")
+    for dimension in image.size:
+        image_digest.update(int(dimension).to_bytes(8, "big"))
+    image_digest.update(image.tobytes())
+    image_id = int.from_bytes(image_digest.digest()[:8], "big")
+    cached.update(
+        affordance_id=torch.tensor(AFFORD_LABEL.index(affordance.lower()), dtype=torch.long),
+        image_id=torch.tensor(image_id & ((1 << 63) - 1), dtype=torch.long),
+        point_canonical_indices=torch.from_numpy(inverse).long(),
+    )
+    return cached
+
+
+def _prepare_cf_pairs(dataset, dataset_name, index_path):
+    dataset.cf_index_path = ""
+    dataset.cf_pairs = []
+    if not index_path:
+        return
+    if dataset.split != "train":
+        raise ValueError("Counterfactual indexes are restricted to the training split")
+    if dataset.model_variant not in ROLE_VARIANTS:
+        raise ValueError("Counterfactual sampling requires a CRIM role-token variant")
+    from src.models.crag.counterfactual import load_cf_index
+    dataset.cf_index_path = os.path.abspath(os.path.expanduser(index_path))
+    index = load_cf_index(dataset.cf_index_path, dataset.data_root, dataset_name,
+                          dataset.setting, dataset.point_files)
+    dataset.cf_pairs = index["pairs"]
+    dataset.cf_overlap_threshold = index["overlap_threshold"]
+    dataset.cf_statistics = index["statistics"]
+    if not dataset.cf_pairs:
+        raise ValueError("Counterfactual sampling was enabled but no legal training pairs exist")
+
+
+def _sample_batch(dataset, indices):
+    if not dataset.cf_pairs:
+        return [dataset[index] for index in indices]
+    if len(indices) < 2 or len(indices) % 2:
+        raise ValueError("Counterfactual sampling requires an even local batch size of at least two")
+    samples = []
+    for _ in range(len(indices) // 2):
+        pair = random.choice(dataset.cf_pairs)
+        first = dataset._sample_point_idx(pair["point_a"])
+        second = dataset._sample_point_idx(pair["point_b"])
+        if first[5]["point_key"] != pair["point_key"] or second[5]["point_key"] != pair["point_key"]:
+            raise ValueError("Counterfactual shape coordinates changed after index construction")
+        if first[5]["affordance_id"].item() == second[5]["affordance_id"].item():
+            raise ValueError("Counterfactual samples must use different affordances")
+        samples.extend((first, second))
+    return samples
+
+
 def collate_fn(
-    batch, tokenizer=None, processor=None, model_name="qwen_vl"
+    batch, tokenizer=None, processor=None, model_name="qwen_vl", role_token_ids=None
 ):
     """
     Custom collate function for Qwen-VL model to process images once and handle multiple conversations efficiently.
@@ -94,6 +157,8 @@ def collate_fn(
     cnt = 0
     inferences = []
     feature_list, part_id_list, point_keys = [], [], []
+    affordance_ids, image_ids, canonical_indices = [], [], []
+    has_roles = None
     feature_shape = None
 
     for sample in batch:
@@ -118,6 +183,29 @@ def collate_fn(
             feature_list.append(features)
             part_id_list.append(part_ids)
             point_keys.append(cached["point_key"])
+            role_fields = ROLE_METADATA_FIELDS.intersection(cached)
+            if role_fields and role_fields != ROLE_METADATA_FIELDS:
+                raise ValueError("Role batches require affordance IDs, image IDs and canonical point indices")
+            sample_has_roles = bool(role_fields)
+            if has_roles is not None and has_roles != sample_has_roles:
+                raise ValueError("Each batch must use one consistent role-supervision format")
+            has_roles = sample_has_roles
+            if has_roles:
+                affordance_id, image_id = cached["affordance_id"], cached["image_id"]
+                canonical = cached["point_canonical_indices"]
+                if (not isinstance(affordance_id, torch.Tensor) or affordance_id.dtype != torch.long
+                        or affordance_id.ndim != 0 or not 0 <= affordance_id.item() < len(AFFORD_LABEL)):
+                    raise ValueError("Invalid role affordance ID")
+                if (not isinstance(image_id, torch.Tensor) or image_id.dtype != torch.long
+                        or image_id.ndim != 0 or image_id.item() < 0):
+                    raise ValueError("Invalid stable role image ID")
+                if (not isinstance(canonical, torch.Tensor) or canonical.dtype != torch.long
+                        or canonical.shape != (point.shape[1],)
+                        or not torch.equal(canonical.sort().values, torch.arange(point.shape[1]))):
+                    raise ValueError("Canonical point indices must be a permutation of the input point rows")
+                affordance_ids.append(affordance_id)
+                image_ids.append(image_id)
+                canonical_indices.append(canonical)
         conversation = [conversation]
         image_list.append(image)
         point_list.append(torch.from_numpy(point).float())
@@ -208,6 +296,22 @@ def collate_fn(
                 label[start_idx:end_idx] = target[start_idx:end_idx]
             targets[idx] = label
 
+        if has_roles:
+            if not isinstance(role_token_ids, dict) or set(role_token_ids) != {"contact", "effect", "exclude"}:
+                raise ValueError("CRIM collate requires contact/effect/exclude token IDs")
+            ids = list(role_token_ids.values())
+            if (any(not isinstance(token_id, int) or isinstance(token_id, bool) or token_id < 0 for token_id in ids)
+                    or len(set(ids)) != 3):
+                raise ValueError("Role token IDs must be three distinct nonnegative integers")
+            for name, token_id in role_token_ids.items():
+                mask = input_ids == token_id
+                if not torch.all(mask.sum(dim=-1) == 1):
+                    raise ValueError(f"Each conversation must contain exactly one {name} token")
+                if (targets[mask] == -100).any():
+                    raise ValueError(f"The {name} token must remain in the assistant CE target")
+        elif role_token_ids is not None:
+            raise ValueError("Role-token collate IDs were supplied without role-supervision metadata")
+
         cumsum_tokens = torch.cumsum(torch.tensor(nb_token_list), dim=0)
         duplicated_pixel_values = []
         for i in range(len(image_grid_thw)):
@@ -240,6 +344,12 @@ def collate_fn(
             partfield_part_ids=torch.stack(part_id_list, dim=0),
             point_key=point_keys,
         )
+    if has_roles:
+        result.update(
+            affordance_ids=torch.stack(affordance_ids),
+            image_ids=torch.stack(image_ids),
+            point_canonical_indices=torch.stack(canonical_indices),
+        )
     return result
 
 
@@ -255,6 +365,7 @@ class PIADAfford(Dataset):
         question_type='simple', # 'simple' or 'afford' or 'afford_obj'
         model_variant='hammer',
         partfield_cache_dir='',
+        cf_index_path='',
     ):
         super().__init__()
         self.samples_per_epoch = samples_per_epoch
@@ -286,6 +397,8 @@ class PIADAfford(Dataset):
         elif self.question_type == 'afford_obj':
             self.answer_list = OAFFORD_AFFORD_OBJ_ANSWER_LIST
             self.question_list = OAFFORD_AFFORD_QUESTION_LIST
+        if self.model_variant in ROLE_VARIANTS:
+            self.answer_list = CRAG_ROLE_ANSWER_LIST
 
         img_path = os.path.join(data_root, f'PIADv2/{setting}/Img_{split}.txt')
         point_path = os.path.join(data_root, f'PIADv2/{setting}/Point_{split}.txt')
@@ -303,6 +416,7 @@ class PIADAfford(Dataset):
                     start += self.num_dict[obj][aff]
         else:
             self.image_files = self.read_file(img_path)
+        _prepare_cf_pairs(self, "PIADv2", cf_index_path)
 
     def read_file(self, path, num_dict=None):
         file_list = []
@@ -350,7 +464,12 @@ class PIADAfford(Dataset):
 
     def __getitem__(self, idx):
         idx = random.randint(0, len(self.point_files) - 1) if self.split == 'train' else idx
+        return self._sample_point_idx(idx)
 
+    def __getitems__(self, indices):
+        return _sample_batch(self, indices)
+
+    def _sample_point_idx(self, idx):
         point_file = self.point_files[idx]
         point, afford = self.extract_point_file(point_file)
         raw_point = point
@@ -371,6 +490,7 @@ class PIADAfford(Dataset):
         assert img_afford == afford_name, \
             f"Image affordance {img_afford} does not match point affordance {afford_name}."
         image_vlm = Image.open(img_file).convert('RGB')
+        cached = _role_metadata(cached, self.model_variant, raw_point, afford_name, image_vlm)
         conversation = self.generate_cnversation(obj_name, afford_name)
         inference = False if self.split == 'train' else True
 
@@ -403,6 +523,7 @@ class PIADv1Afford(Dataset):
         question_type='simple', # 'simple' or 'afford' or 'afford_obj'
         model_variant='hammer',
         partfield_cache_dir='',
+        cf_index_path='',
     ):
         super().__init__()
         self.samples_per_epoch = samples_per_epoch
@@ -448,6 +569,8 @@ class PIADv1Afford(Dataset):
         elif self.question_type == 'afford_obj':
             self.answer_list = OAFFORD_AFFORD_OBJ_ANSWER_LIST
             self.question_list = OAFFORD_AFFORD_QUESTION_LIST
+        if self.model_variant in ROLE_VARIANTS:
+            self.answer_list = CRAG_ROLE_ANSWER_LIST
 
         img_path = os.path.join(data_root, f'PIADv1/{setting}/Img_{split}.txt')
 
@@ -466,6 +589,7 @@ class PIADv1Afford(Dataset):
             point_path = os.path.join(data_root, f'PIADv1/{setting}/Point_test.txt')
             self.point_files = self.read_file(point_path)
             self.image_files = self.read_file(img_path)
+        _prepare_cf_pairs(self, "PIADv1", cf_index_path)
 
     def read_file(self, path, num_dict=None):
         file_list = []
@@ -513,6 +637,12 @@ class PIADv1Afford(Dataset):
 
     def __getitem__(self, idx):
         idx = random.randint(0, len(self.point_files) - 1) if self.split == 'train' else idx
+        return self._sample_point_idx(idx)
+
+    def __getitems__(self, indices):
+        return _sample_batch(self, indices)
+
+    def _sample_point_idx(self, idx):
         point_file = self.point_files[idx]
         point, afford = self.extract_point_file(point_file)
         raw_point = point
@@ -534,6 +664,7 @@ class PIADv1Afford(Dataset):
             obj_name, afford_name = img_file.split('/')[-3], img_file.split('/')[-2]
             
         image_vlm = Image.open(img_file).convert('RGB')
+        cached = _role_metadata(cached, self.model_variant, raw_point, afford_name, image_vlm)
         conversation = self.generate_cnversation(obj_name, afford_name)
         inference = False if self.split == 'train' else True
 
