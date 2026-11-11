@@ -104,8 +104,8 @@ HAMMER 基线固定为 `e8aa2e6f5c705d1e58f129e9426870877be03011`，可从该提
 阶段 1 的真实单批前向/反向已通过。阶段 2 已完成全量离线缓存和模型接入，
 真实缓存的训练入口前向/反向检查已通过。阶段 3 的三角色 CRIM、训练集反事实监督
 和短程更新检查已完成。阶段 4 的 FGED 已接入 `crag3d` 并通过真实更新检查；
-阶段 5 的首轮完整训练、验证、断点保存与严格恢复已通过，其余轮次正在后台续跑；
-完整 30 轮日程尚未完成，阶段 6 尚未开始。
+阶段 5 的首轮完整训练、验证、断点保存与严格恢复已通过，PIADv1 Seen 的
+完整 30 轮、5880 步日程已完成。阶段 5 已停止等待验收，阶段 6 尚未开始。
 
 原 shell 支持 `-m hammer|partfield|crim|crag3d`、`-c PARTFIELD_CACHE_DIR`，以及 `--` 后透传
 `train.py` 参数。新增参数包括 `--role_loss_weight`、`--graph_loss_weight`、
@@ -381,11 +381,11 @@ autograd 核验的最大误差为 `1.66893e-6`；`y0`、正负边权、部件分
 源码 SHA256 `a01a0a2e36d885894d3f7e3c31b7c130dc9c21737e9b395f4328ca10a89c8bf4`
 与验证快照及 provenance 一致。阶段 4 交付后已停止，现按验收后的指令进入阶段 5。
 
-### 阶段 5：完整训练与严格断点恢复（首轮与恢复已通过，完整日程进行中）
+### 阶段 5：完整训练与严格断点恢复（已完成，等待验收）
 
 保留原 `train.py`、DeepSpeed ZeRO-2、LoRA、AdamW、WarmupDecayLR 和
 `tools/trainer.py` 的训练/验证调用。PIADv1 默认仍为 30 epochs、每轮 196 次 optimizer
-updates、全局 batch 64。当前运行使用 GPU 0–3、每卡 microbatch 2、累积 8、BF16；
+updates、全局 batch 64。本次运行使用 GPU 0–3、每卡 microbatch 2、累积 8、BF16；
 LoRA r=16/alpha=32，主 CE/CA 权重仍为 1/2。`--train_workers` 只控制 DeepSpeed
 训练 I/O worker 数，默认每 rank 2；`--workers` 仍控制验证 DataLoader，本次设为 2。
 
@@ -429,7 +429,7 @@ bash scripts/train.sh -d PIADv1 -p Seen -m crag3d \
   --cf_loss_weight 0.1 --cf_index_path "$PWD/data/cf_index/PIADv1_Seen.json" \
   --stop_after_epoch 1
 
-# 当前后台续跑：在新实验目录恢复既定的 30 epochs；不再带 stop_after_epoch 1。
+# 已完成续跑：在新实验目录恢复既定的 30 epochs；不再带 stop_after_epoch 1。
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 PYTHON_BIN=/home/hzl/miniconda3/envs/hammer/bin/python \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
@@ -449,16 +449,16 @@ bash scripts/train.sh -d PIADv1 -p Seen -m crag3d \
 没有错误栈，也没有产出 checkpoint，不能计作完整首轮通过。排查时无法读取 `dmesg`，
 退出原因尚未确定；保留原现场，使用新名称 `crag_stage5_epoch1_verified` 的重跑已完成。
 
-按用户确认，首轮及恢复后的余下 29 轮持续在后台执行并报告进度。独立 user systemd
+按用户确认，首轮及恢复后的余下 29 轮已在后台完成并报告进度。独立 user systemd
 服务 `hammer-crag-stage5-20261110.service` 的 `RuntimeMaxSec=infinity`，由本地
 `exp/crag_stage5_run_20261110/runner.py` 顺序调用原 shell：先完成首轮并检查退出状态、
 `training_result.json` 和 `last_model/latest`，再重新检查 GPU 0–3 空闲，恢复并完成
 既定的 30-epoch 总日程。失败会写入状态并停止，不将后台启动等同于训练验收完成。
-runner、状态和运行日志均为被忽略的本地运行文件，不提交源码仓库。状态文件每 15 秒更新，
+runner、状态和运行日志均为被忽略的本地运行文件，不提交源码仓库。运行期间状态文件每 15 秒更新，
 标准输出分别记录在 `first_epoch.stdout.log` 与 `resumed_training.stdout.log`。
 
 ```bash
-# 查询当前后台服务及其最新训练/验证进度。
+# 查询服务和运行记录；完成后服务已退出，最终结果以 status.json 为准。
 systemctl --user status hammer-crag-stage5-20261110.service --no-pager
 cat /home/hzl/my_project/Hammer/exp/crag_stage5_run_20261110/status.json
 ```
@@ -466,11 +466,14 @@ cat /home/hzl/my_project/Hammer/exp/crag_stage5_run_20261110/status.json
 当前训练源码 SHA256 为
 `b60144512d0c893517a5168d10e28ee284d65899d1d39769f3c38ccfa6ca5831`，
 首轮与恢复快照、provenance 和当前源码一致。2026-11-10 的重跑完成原入口规定的
-196 个优化步骤（全局 batch 64）和全部 1012 个验证样本，首轮结果为：
+196 个优化步骤（全局 batch 64）和全部 1012 个验证样本。首轮、原 aIoU 选优轮次和
+最后一轮的真实结果为：
 
-| 已完成 epoch | AUC | aIoU | SIM | MAE |
+| epoch | AUC | aIoU | SIM | MAE |
 | --- | ---: | ---: | ---: | ---: |
 | 1 | 0.81220120 | 0.11706334 | 0.49816824 | 0.11194252 |
+| 27（最佳 aIoU） | 0.86939064 | 0.19115923 | 0.58172092 | 0.08767969 |
+| 30（最终） | 0.87050942 | 0.19014664 | 0.58232764 | 0.08645468 |
 
 原生 `global_step196` 断点包含完整模型和四份 BF16 ZeRO-2 optimizer 分片，四个 rank
 正常退出。完成合同、分片库存和词表校验通过，最新与最佳断点的原生分片 hard links
@@ -479,12 +482,26 @@ cat /home/hzl/my_project/Hammer/exp/crag_stage5_run_20261110/status.json
 `best_iou=0.1170633414` 和下一个 epoch 均已恢复。恢复后已实际执行第 2 轮的优化步骤，
 没有重置 optimizer、预热或完整 5880-step scheduler。
 
-这些结果验证了训练和断点链路；仅有一轮验证结果，不能据此声称优于 HAMMER。
-第 2–30 轮持续运行，`full_schedule_completed` 当前仍为 `false`；完整日程结果待补充。
-首轮记录位于
+完整日程于 2026-11-11 13:08（Asia/Shanghai）结束，累计 30 轮、5880 个优化步骤，
+每轮均使用原入口完成 1012 个样本的验证。`training_result.json` 的
+`full_schedule_completed=true`、`completed_epochs=30`、`global_steps=5880` 与日志一致。
+首轮进程和恢复后的训练进程均以状态 0 结束，四个训练 rank 正常退出，GPU 0–3 已释放。
+
+最终完整断点为恢复实验中的 `last_model/global_step5880`；按原验证 aIoU 选优的断点为
+`model/global_step5292`（第 27 轮），没有按其他指标另选 checkpoint。
+最终与最佳断点的完成合同、词表及全部四个 rank 的 optimizer 分片已核验。
+CPU mmap 读取原生状态确认：四个 rank 的 Adam step 分别为 5880/5292，scheduler
+迭代位置分别为 5879/5291，Adam moments 与 master 分片均为 FP32，CONTACT 队列和
+三个角色词表合同完整。
+训练源码对应已提交的 `0843c95d60d5eb3b2fcdb3aaf2fd96e4ec1dbcbb`；原始运行记录的
+`git_commit` 保持不变，通过 `verified_source_commit` 关联相同源码 SHA256 的提交。
+
+本次完成的是 PIADv1 Seen 的完整训练与恢复链路。尚未执行阶段 6 的五种划分完整对照、
+基线和消融评测，不能据此声称优于 HAMMER。首轮记录位于
 `exp/PIADv1_Seen_afford_obj_crag_stage5_epoch1_verified/{provenance.json,train.log,training_result.json}`；
 恢复证据位于 `exp/PIADv1_Seen_afford_obj_crag_stage5_resumed/resume_verification.json`，
-最终日程结果在该恢复实验的 `training_result.json`。阶段 6 尚未开始。
+最终日程结果及全部 30 轮指标在该恢复实验的 `training_result.json`。
+阶段 5 已完成并停止，等待用户验收后再决定后续阶段；阶段 6 尚未开始。
 
 ## :books: License
 This repository is released under the [MIT license](LICENSE).
