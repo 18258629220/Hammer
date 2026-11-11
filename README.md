@@ -93,7 +93,7 @@ bash scripts/train.sh -d PIADv1 -p Seen -g 4 -b 64 -l 0.0001 -e 30 -n exp1
 
 ## :flying_saucer: Inference
 ```bash
-bash scripts/eval.sh
+bash scripts/eval.sh --weight /path/to/downloaded/model.bin --dataset PIADv1 --setting Seen
 ```
 
 ## CRAG-3D 分阶段实施
@@ -105,7 +105,8 @@ HAMMER 基线固定为 `e8aa2e6f5c705d1e58f129e9426870877be03011`，可从该提
 真实缓存的训练入口前向/反向检查已通过。阶段 3 的三角色 CRIM、训练集反事实监督
 和短程更新检查已完成。阶段 4 的 FGED 已接入 `crag3d` 并通过真实更新检查；
 阶段 5 的首轮完整训练、验证、断点保存与严格恢复已通过，PIADv1 Seen 的
-完整 30 轮、5880 步日程已完成。阶段 5 已停止等待验收，阶段 6 尚未开始。
+完整 30 轮、5880 步日程已完成。按后续指示进入阶段 6，当前仅比较已有 CRAG 与
+HAMMER 断点的效果；消融和其他划分的新训练暂不执行。
 
 原 shell 支持 `-m hammer|partfield|crim|crag3d`、`-c PARTFIELD_CACHE_DIR`，以及 `--` 后透传
 `train.py` 参数。新增参数包括 `--role_loss_weight`、`--graph_loss_weight`、
@@ -381,7 +382,7 @@ autograd 核验的最大误差为 `1.66893e-6`；`y0`、正负边权、部件分
 源码 SHA256 `a01a0a2e36d885894d3f7e3c31b7c130dc9c21737e9b395f4328ca10a89c8bf4`
 与验证快照及 provenance 一致。阶段 4 交付后已停止，现按验收后的指令进入阶段 5。
 
-### 阶段 5：完整训练与严格断点恢复（已完成，等待验收）
+### 阶段 5：完整训练与严格断点恢复（已完成）
 
 保留原 `train.py`、DeepSpeed ZeRO-2、LoRA、AdamW、WarmupDecayLR 和
 `tools/trainer.py` 的训练/验证调用。PIADv1 默认仍为 30 epochs、每轮 196 次 optimizer
@@ -496,12 +497,127 @@ CPU mmap 读取原生状态确认：四个 rank 的 Adam step 分别为 5880/529
 训练源码对应已提交的 `0843c95d60d5eb3b2fcdb3aaf2fd96e4ec1dbcbb`；原始运行记录的
 `git_commit` 保持不变，通过 `verified_source_commit` 关联相同源码 SHA256 的提交。
 
-本次完成的是 PIADv1 Seen 的完整训练与恢复链路。尚未执行阶段 6 的五种划分完整对照、
-基线和消融评测，不能据此声称优于 HAMMER。首轮记录位于
+本阶段完成的是 PIADv1 Seen 的完整训练与恢复链路，不能单凭训练结果声称优于 HAMMER。
+首轮记录位于
 `exp/PIADv1_Seen_afford_obj_crag_stage5_epoch1_verified/{provenance.json,train.log,training_result.json}`；
 恢复证据位于 `exp/PIADv1_Seen_afford_obj_crag_stage5_resumed/resume_verification.json`，
 最终日程结果及全部 30 轮指标在该恢复实验的 `training_result.json`。
-阶段 5 已完成并停止，等待用户验收后再决定后续阶段；阶段 6 尚未开始。
+阶段 5 已完成并停止。后续已有权重的直接比较见下节；五种划分的新训练和消融尚未执行。
+
+### 阶段 6 当前交付：既有权重的效果对比（已完成，消融暂缓）
+
+按用户最新指示，本次只评测已有权重，不运行消融或其他划分的新训练。
+对照是本地旧 HAMMER 实验 `PIADv1_Seen_afford_obj_exp1/model/global_step4704`，
+不是已确认的官方发布权重；候选是阶段 5 的 CRAG 最佳
+`PIADv1_Seen_afford_obj_crag_stage5_resumed/model/global_step5292`。
+两者分别来自第 24 / 27 轮。CRAG 的完整训练已结束于第 30 轮，当前比较使用原 aIoU
+选出的最佳断点。旧 HAMMER 日志在第 25 轮中途停止，不能声称它完成了 30 轮。
+
+评测复用原 `tools/trainer.py:evaluate`，没有更改 AUC、20 阈值 aIoU、SIM 或 MAE 的定义。
+两个模型均严格加载原生 ZeRO-2 全部模型键，核对模型及四个 rank 的 optimizer 分片；
+推理保持完整模型 BF16。CRAG 额外检查完成合同、角色词表、PartField 缓存和数据清单。
+原生权重直接加载，不合并或另存一套多 GB 权重。旧 merged `model.bin` 入口仍可使用。
+
+两次完整评测均在 PIADv1 Seen 的原 `test` 划分完成 1012 例、退出码 0。
+逐例图片、原点顺序、归一化坐标、GT 与用户问题完全一致；回答保留各自的原生任务/角色模板。
+原验证在测试时仍随机抽取问答模板，HAMMER / CRAG 的回答模板分别有 5 / 3 条，
+仅设同一全局 seed 不能保证后续问题相同。因此本次按 `3407 + 原始样本索引` 固定 Python
+模板 RNG，batch=1、workers=2、min/max pixels=200704/1003520、最大长度 8192。
+这是固定模板的新评测，不能宣称逐位复现训练时的随机验证。两者均沿用原入口包含任务名称
+的 teacher-forced 回答，不代表自由生成任务名后的端到端性能。
+
+| 原始指标（0–1） | HAMMER 本地最佳 | CRAG 最佳 | CRAG − HAMMER |
+| --- | ---: | ---: | ---: |
+| AUC ↑ | 0.878361 | 0.869311 | −0.009050 |
+| aIoU ↑ | 0.215327 | 0.191054 | −0.024273 |
+| SIM ↑ | 0.596151 | 0.581734 | −0.014417 |
+| MAE ↓ | 0.084447 | 0.087661 | +0.003214 |
+
+当前 CRAG 的四项总体指标均弱于此 HAMMER 断点，aIoU 下降约 **2.43 个百分点**。
+965 个二值 GT 非恒定样本中，逐例 aIoU 为 381 例提高、584 例降低；其余 47 例按原协议
+不参与 AUC/aIoU 均值，仍参与 SIM/MAE。比较工具从保存预测重新调用原 evaluator，
+整体和逐例指标核验通过，点与 GT 数组用 `np.array_equal` 精确匹配。
+
+主要差异具有任务依赖性。下表样本数为“总数 / AUC、aIoU 有效数”，各行仍调用原 evaluator：
+
+| 对象 / 任务 | 样本数 | HAMMER aIoU | CRAG y0 aIoU | CRAG 最终 aIoU | 最终相对 HAMMER（百分点） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Display / display | 52 / 52 | 0.332855 | 0.091973 | 0.089557 | −24.33 |
+| Keyboard / press | 25 / 25 | 0.117356 | 0.013413 | 0.012261 | −10.51 |
+| Chair / sit | 166 / 165 | 0.394988 | 0.387435 | 0.370622 | −2.44 |
+| Door / open | 18 / 17 | 0.045543 | 0.225270 | 0.218040 | +17.25 |
+| Laptop / display | 15 / 15 | 0.311552 | 0.456530 | 0.429820 | +11.83 |
+| Bag / open | 4 / 2 | 0.129691 | 0.164120 | 0.146184 | +1.65 |
+
+Display 的 52 个有效样本对总体 aIoU 均值差贡献约 −1.31 个百分点，约占总差距的 54%。
+其初始 `y0` 已明显落后，说明差距不能只由最后的能量优化解释。
+Chair/Sit 的 SIM 从 0.716985 提高到 0.733043，但 MAE 从 0.064844 增至 0.068179，
+aIoU 同时下降，不能笼统称为“泄漏已解决”。Bag/Open 只有两个非恒定 GT 样本，
+另两个索引 35、36 的 GT 全零；不能从空 GT 图判断袋口覆盖改善，也不能将这一小组收益
+推广到全部对象。全部 23 个对象、17 个任务及对象/任务组合的细分结果保存在本地 JSON。
+
+同一次 CRAG 前向的已有输出揭示了细化过程的取舍，没有关闭模块或另训模型：
+
+| 原始指标 | CRAG y0 | CRAG 最终 | 最终 − y0 |
+| --- | ---: | ---: | ---: |
+| AUC ↑ | 0.868882 | 0.869311 | +0.000429 |
+| aIoU ↑ | 0.199276 | 0.191054 | −0.008222 |
+| SIM ↑ | 0.579194 | 0.581734 | +0.002539 |
+| MAE ↓ | 0.090896 | 0.087661 | −0.003235 |
+
+细化后 125 / 965 个有效样本的 aIoU 提高，840 例降低。1012 例的全部能量迭代均非增
+（绝对容差 `1e-5`），平均能量从 75.3991 降至 66.3054；这不代表准确率提升。
+最终响应相对 y0 平均降低 0.005453，其中 GT≥0.5 点平均降低 0.019038，其他点降低
+0.004443。这些描述性统计与阈值 aIoU 受损、SIM/MAE 改善并存，不能据此确定单一因果。
+即使只看 y0，其 aIoU 仍比 HAMMER 低 0.016051；剩余 0.008222 的差距出现在当前
+细化输出中。这是现有输出的数值差距分解，不等同于独立消融结果。
+
+热图使用相同坐标、正交视角及 0–1 色标，依次展示配对图片、GT、HAMMER、CRAG y0、
+CRAG final。固定索引 35 / 50 在评测前选定；索引 37 是原顺序首个有效 Bag/Open；
+索引 648 是事后定位到最大退化对象组 Display 的首例，属于探索性分析。
+索引 622 / 773 分别按最大逐例 aIoU 降低 / 提高选取，不能当作随机代表样本。
+Display 示例可见 CRAG 的屏幕响应在 y0 阶段已偏弱；Microwave/Open 的最大退化例中，
+GT 的小热区附近出现更广泛的预测响应。它们支持分别检查初始热图和细化抑制的后续方向，
+尚不能证明具体损失项或 PartField 聚类导致了问题。部件 ID 不是人工语义部件标注，
+本次不报告“扶手 IoU”或其他新定义的评测指标。
+
+这仍是**现有 checkpoint 的效果比较**，不是严格等预算的算法归因：旧 HAMMER 使用
+seed 5315896、仅 `q_proj` LoRA；CRAG 使用 seed 3407、`q_proj,v_proj` LoRA。
+旧源码的目标字符串 `"q_proj, v_proj"` 未去空格，实际原生权重只含 q 的 LoRA，加载时
+已按真实键处理，没有补造 v 权重。两者 r=16、alpha=32、LR=1e-4、全局 batch=64、
+CE/CA=1/2 相同，但旧训练 micro1×accum16，CRAG micro2×accum8；最佳断点步数不同，
+3D 骨干也由 PointNet++ 变为使用外部 PartField 预训练特征的结构。两者均按原 test
+验证 aIoU 选优，存在前述测试选模型的限制；没有多 seed 统计，不能作显著性结论或推广到
+其他四种划分。旧实验仅保留代码快照，没有当时独立的完整 provenance，现存快照的哈希
+不能替代缺失的原始来源记录。
+
+以下是本次已执行命令；重跑应换用新输出目录（eval 拒绝覆盖现有目录），并确认目标 GPU 空闲：
+
+```bash
+export PYTHON_BIN=/home/hzl/miniconda3/envs/hammer/bin/python
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+EVAL_ROOT="$PWD/exp/crag_stage6_comparison_20261111"
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 bash scripts/eval.sh \
+  --weight exp/PIADv1_Seen_afford_obj_exp1/model --model_variant hammer \
+  --lora_r 16 --lora_alpha 32 --lora_dropout 0.05 --lora_target_modules q_proj \
+  --dataset PIADv1 --setting Seen --question_type afford_obj --seed 3407 \
+  --val_batch_size 1 --workers 2 --output_dir "$EVAL_ROOT/hammer" --save_predictions
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 bash scripts/eval.sh \
+  --weight exp/PIADv1_Seen_afford_obj_crag_stage5_resumed/model --model_variant auto \
+  --partfield_cache_dir data/partfield_cache \
+  --dataset PIADv1 --setting Seen --question_type afford_obj --seed 3407 \
+  --val_batch_size 1 --workers 2 --output_dir "$EVAL_ROOT/crag" --save_predictions
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 "$PYTHON_BIN" tools/compare_predictions.py \
+  --baseline_dir "$EVAL_ROOT/hammer" --candidate_dir "$EVAL_ROOT/crag" \
+  --output_dir "$EVAL_ROOT/analysis"
+```
+
+实际结果保存在被忽略的 `exp/crag_stage6_comparison_20261111/`：两模型各有 `metrics.json`、
+`provenance.json`、`predictions.npz`；`analysis/comparison.json` 包含全部分组、逐例差异、
+响应/能量诊断和热图选择规则，PNG 图也在 `analysis/`。模型源码和原生权重未修改，
+本次仅修改评测入口、严格加载与比较工具及本文档。两次完整评测与 CPU 比较均成功，
+Python 语法、shell 语法和 diff 检查通过，GPU 0–1 已释放。本轮直接比较完成后停止，
+等待用户验收；未执行消融、其他划分训练或启动新的跟进自动化。
 
 ## :books: License
 This repository is released under the [MIT license](LICENSE).

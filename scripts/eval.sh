@@ -1,16 +1,8 @@
-#!/bin/bash
-
-# Usage: bash scripts/eval.sh
-
-# Set the used cuda path; maybe unnecessary
-export PATH=$HOME/local/cuda-11.8/bin:$PATH
-export LD_LIBRARY_PATH=$HOME/local/cuda-11.8/lib64:$LD_LIBRARY_PATH
-
-export PYTHONPATH=./
-
-DATASET=PIADv1
-SETTING=Seen
-# https://huggingface.co/RayYoh/Hammer/tree/main
-CPT_PATH=path/to/downloaded/model.bin
-
-python tools/eval.py --weight $CPT_PATH --dataset $DATASET --setting $SETTING
+#!/usr/bin/env bash
+# Example: PYTHON_BIN=/path/to/python CUDA_VISIBLE_DEVICES=0 bash scripts/eval.sh \
+#   --weight /path/to/checkpoint --dataset PIADv1 --setting Seen --save_predictions
+set -euo pipefail
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$PROJECT_ROOT"
+exec "${PYTHON_BIN:-python}" tools/eval.py "$@"
