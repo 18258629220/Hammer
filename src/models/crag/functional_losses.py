@@ -40,33 +40,6 @@ def foreground_iou_loss(pred, gt):
         return (errors * weights).sum(1).mean()
 
 
-def soft_target_calibration_loss(pred, gt):
-    """Numerically smoothed proper log score for soft heatmaps [B,N,1].
-
-    BCE is evaluated after applying the same fixed symmetric-noise channel
-    eps + (1-2*eps)*value to prediction and detached original soft target.
-    This is a bounded-gradient BCE modification, not unsmoothed BCE; its
-    unique minimum remains pred=gt, including the endpoints. Separate
-    complement expressions avoid FP32 cancellation near one. Each shape
-    has equal weight and no threshold or trainable calibration is introduced.
-    """
-    if (pred.ndim != 3 or pred.shape != gt.shape or pred.shape[-1] != 1
-            or min(pred.shape[:2]) < 1):
-        raise ValueError("Calibration inputs must be aligned nonempty [B,N,1]")
-    if not pred.is_floating_point() or pred.device != gt.device:
-        raise ValueError("Calibration probabilities must be floating point on the GT device")
-    with torch.autocast(device_type=pred.device.type, enabled=False):
-        eps = 1e-4
-        scale = 1-2*eps
-        probabilities, targets = pred.float(), gt.detach().float()
-        positive_p = eps + scale*probabilities
-        positive_q = eps + scale*targets
-        negative_p = eps + scale*(1-probabilities)
-        negative_q = eps + scale*(1-targets)
-        loss = -positive_q*positive_p.log() - negative_q*negative_p.log()
-        return loss.flatten(1).mean(1).mean()
-
-
 def _balanced_edge_bce(logits, targets, weights):
     """Balance foreground/background soft mass without hardening soft labels.
 
