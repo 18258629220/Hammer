@@ -12,7 +12,12 @@ def _inverse_softplus(value):
 
 
 class EnergyDecoder(nn.Module):
-    """Unroll the specified energy without second-order autograd or detaches.
+    """Unroll signed boundary contrast without second-order autograd or detaches.
+
+    Negative edges reward squared response differences, so they do not punish
+    equal high responses. This energy may be nonconvex and negative. Pairwise
+    flux cancels before projection, but anchors, linear exclusion and clipping
+    do not guarantee total-mass conservation for the complete decoder.
 
     Each listed edge contributes once to the energy and to both endpoint
     gradients. Directed reverse edges, if present, are separate energy terms.
@@ -84,7 +89,7 @@ class EnergyDecoder(nn.Module):
         return (
             (confidence * (y-y0).square()).sum(-1)
             + positive * (a_pos * (left-right).square()).sum(-1)
-            + negative * (a_neg * left * right).sum(-1)
+            - negative * (a_neg * (left-right).square()).sum(-1)
             + exclude * (exclusion * y).sum(-1)
         )
 
@@ -92,10 +97,10 @@ class EnergyDecoder(nn.Module):
     def _gradient(y, y0, source, target, a_pos, a_neg, confidence, exclusion, coefficients):
         positive, negative, exclude = coefficients.unbind()
         left, right = y.gather(1, source), y.gather(1, target)
-        flux = 2 * positive * a_pos * (left-right)
+        flux = 2 * (positive * a_pos - negative * a_neg) * (left-right)
         gradient = 2 * confidence * (y-y0) + exclude * exclusion
-        gradient = gradient.scatter_add(1, source, flux + negative * a_neg * right)
-        return gradient.scatter_add(1, target, -flux + negative * a_neg * left)
+        gradient = gradient.scatter_add(1, source, flux)
+        return gradient.scatter_add(1, target, -flux)
 
     def energy(self, y, y0, edge_index, a_pos, a_neg, anchor_confidence, exclusion):
         """Return E(y) per shape [B]; y/y0 use [B,N,1], with no GT input."""
@@ -141,7 +146,7 @@ class EnergyDecoder(nn.Module):
             # Absolute row-sum bound of the symmetric Hessian. Negative
             # affinity may make E nonconvex, but this is still an L-smooth bound.
             row_bound = (2 * confidence + 4 * coefficients[0] * positive_degree
-                         + coefficients[1] * negative_degree)
+                         + 4 * coefficients[1] * negative_degree)
             lipschitz = row_bound.amax(-1, keepdim=True)
             rate = self.step_fraction_logit.float().sigmoid() / (lipschitz + 1e-6)
             if not torch.isfinite(lipschitz).all() or not torch.isfinite(rate).all() or (rate <= 0).any():
