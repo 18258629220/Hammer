@@ -81,11 +81,13 @@ class EnergyDecoder(nn.Module):
     def _energy(y, y0, source, target, a_pos, a_neg, confidence, exclusion, coefficients):
         positive, negative, exclude = coefficients.unbind()
         left, right = y.gather(1, source), y.gather(1, target)
+        # Exclusion is supervised as 1-GT. This calibrated unary corrects y
+        # in either direction toward 1-exclusion, rather than only suppressing.
         return (
             (confidence * (y-y0).square()).sum(-1)
             + positive * (a_pos * (left-right).square()).sum(-1)
             + negative * (a_neg * left * right).sum(-1)
-            + exclude * (exclusion * y).sum(-1)
+            + exclude * (exclusion * y.square() + (1-exclusion) * (1-y).square()).sum(-1)
         )
 
     @staticmethod
@@ -93,7 +95,7 @@ class EnergyDecoder(nn.Module):
         positive, negative, exclude = coefficients.unbind()
         left, right = y.gather(1, source), y.gather(1, target)
         flux = 2 * positive * a_pos * (left-right)
-        gradient = 2 * confidence * (y-y0) + exclude * exclusion
+        gradient = 2 * confidence * (y-y0) + 2 * exclude * (y-(1-exclusion))
         gradient = gradient.scatter_add(1, source, flux + negative * a_neg * right)
         return gradient.scatter_add(1, target, -flux + negative * a_neg * left)
 
@@ -140,7 +142,7 @@ class EnergyDecoder(nn.Module):
             negative_degree = negative_degree.scatter_add(1, target, negative_edges)
             # Absolute row-sum bound of the symmetric Hessian. Negative
             # affinity may make E nonconvex, but this is still an L-smooth bound.
-            row_bound = (2 * confidence + 4 * coefficients[0] * positive_degree
+            row_bound = (2 * confidence + 2 * coefficients[2] + 4 * coefficients[0] * positive_degree
                          + coefficients[1] * negative_degree)
             lipschitz = row_bound.amax(-1, keepdim=True)
             rate = self.step_fraction_logit.float().sigmoid() / (lipschitz + 1e-6)
