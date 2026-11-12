@@ -556,7 +556,7 @@ def main(args):
         logger.info("Validation split is test, following the original HAMMER entry point; see provenance.json for the protocol discrepancy.")
 
         if args.debug:
-            wandb.init(mode="disabled")  # Disable wandb in debug mode
+            wandb.init(project=args.project_name, mode="disabled")  # Disable wandb in debug mode
         else:
             wandb.init(
                 project=args.project_name,
@@ -567,7 +567,7 @@ def main(args):
     else:
         writer = None
         logger = get_root_logger(name='train')  # For other ranks
-        wandb.init(mode="disabled")  # Disable wandb for non-master ranks
+        wandb.init(project=args.project_name, mode="disabled")  # Disable wandb for non-master ranks
     device = torch.device(f'cuda:{args.local_rank}')
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
