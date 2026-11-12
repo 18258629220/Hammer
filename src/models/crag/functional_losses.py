@@ -11,6 +11,35 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def foreground_iou_loss(pred, gt):
+    """Equal-shape foreground Lovasz-Sigmoid auxiliary loss for [B,N,1].
+
+    This additional objective uses GT >= .5 while the existing CA objective
+    retains soft heatmaps. It is an IoU surrogate, not the exact 20-threshold
+    aIoU evaluation. Construction follows Berman et al., CVPR 2018:
+    https://openaccess.thecvf.com/content_cvpr_2018/html/Berman_The_LovaSz-Softmax_Loss_CVPR_2018_paper.html
+    All-background targets give max(pred); all-foreground give mean(1-pred).
+    """
+    if (pred.ndim != 3 or pred.shape != gt.shape or pred.shape[-1] != 1
+            or min(pred.shape[:2]) < 1):
+        raise ValueError("IoU auxiliary inputs must be aligned nonempty [B,N,1]")
+    if not pred.is_floating_point() or pred.device != gt.device:
+        raise ValueError("IoU probabilities must be floating point on the GT device")
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        probabilities = pred.float().flatten(1)
+        labels = (gt.detach().flatten(1) >= .5).to(probabilities.dtype)
+        errors, order = (labels - probabilities).abs().sort(dim=1, descending=True)
+        foreground = labels.gather(1, order)
+        count = foreground.sum(1, keepdim=True)
+        intersection = count - foreground.cumsum(1)
+        union = count + (1 - foreground).cumsum(1)
+        jaccard = 1 - intersection / union
+        weights = torch.cat(
+            (jaccard[:, :1], jaccard[:, 1:] - jaccard[:, :-1]), dim=1
+        )
+        return (errors * weights).sum(1).mean()
+
+
 def _balanced_edge_bce(logits, targets, weights):
     """Balance foreground/background soft mass without hardening soft labels.
 

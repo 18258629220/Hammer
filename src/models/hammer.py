@@ -22,7 +22,7 @@ from src.models.crag.crag_losses import CRIMLoss
 from src.models.crag.counterfactual import counterfactual_loss
 from src.models.crag.functional_graph import FunctionalGraph
 from src.models.crag.energy_decoder import EnergyDecoder
-from src.models.crag.functional_losses import FunctionalGraphLoss
+from src.models.crag.functional_losses import FunctionalGraphLoss, foreground_iou_loss
     
 
 class SwapAxes(nn.Module):
@@ -437,11 +437,17 @@ class Hammer(nn.Module):
         if graph is not None:
             graph_losses = self.functional_losses(graph, gt_affords, part_ids, points, features)
             aux_loss = ca_loss(graph["y0"], gt_affords)
+            iou_loss = foreground_iou_loss(pred_afford, gt_affords)
+            aux_iou_loss = foreground_iou_loss(graph["y0"], gt_affords)
             result.update(graph_losses)
             result["aux_loss"] = aux_loss
+            result["iou_loss"] = iou_loss
+            result["aux_iou_loss"] = aux_iou_loss
             result["loss"] = (result["loss"] + self.part_loss_weight * graph_losses["part_loss"]
                               + self.graph_loss_weight * graph_losses["graph_loss"]
-                              + self.aux_loss_weight * aux_loss)
+                              + self.aux_loss_weight * aux_loss
+                              + self.mask_loss_weight * iou_loss
+                              + self.aux_loss_weight * aux_iou_loss)
             result.update(
                 y0=graph["y0"], y_final=pred_afford, part_scores=graph["part_scores"],
                 energy_history=decoded["energy_history"],
