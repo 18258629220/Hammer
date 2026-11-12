@@ -101,6 +101,8 @@ def parse_args(args):
                                 help="Resume complete training state; CRAG requires its saved contract and processor")
     initialization.add_argument("--initialize_from_hammer", default="", type=str,
                                 help="Initialize only compatible VLM weights from HAMMER; never resume optimizer/epochs")
+    initialization.add_argument("--initialize_from_crag", default="", type=str,
+                                help="Initialize the complete native CRAG model; start new optimizer/scheduler at epoch zero")
     parser.add_argument("--hammer_lora_alpha", default=32.0, type=float,
                         help="Declared source LoRA alpha for legacy HAMMER initialization")
     parser.add_argument("--stop_after_epoch", default=None, type=int,
@@ -150,11 +152,15 @@ def parse_args(args):
         parser.error("initialize_from_hammer requires an explicit three-role model")
     if args.initialize_from_hammer and (args.auto_resume or args.start_epoch):
         parser.error("HAMMER weight initialization starts a fresh training run, not a resume")
+    if args.initialize_from_crag and args.model_variant not in ("crim", "crag3d"):
+        parser.error("initialize_from_crag requires the same explicit three-role model")
+    if args.initialize_from_crag and (args.auto_resume or args.start_epoch):
+        parser.error("CRAG model initialization starts a fresh training run, not a resume")
     if not 0 < args.hammer_lora_alpha < float("inf"):
         parser.error("hammer_lora_alpha must be finite and positive")
     if args.start_epoch < 0:
         parser.error("start_epoch must be nonnegative")
-    for name in ("processor_dir", "cf_index_path", "resume", "initialize_from_hammer"):
+    for name in ("processor_dir", "cf_index_path", "resume", "initialize_from_hammer", "initialize_from_crag"):
         if getattr(args, name):
             setattr(args, name, str(Path(getattr(args, name)).expanduser().resolve()))
     return args
@@ -493,6 +499,11 @@ def main(args):
             name: manifest.get(name) for name in
             ("model_sha", "partfield_commit", "feature_dim", "coordinate_system", "version")
         }
+    initialization_source = None
+    if args.initialize_from_crag:
+        from src.utils.crag_initialization import prepare_crag_initialization, initialization_provenance
+        initialization_source = prepare_crag_initialization(args)
+        metadata["initialization"] = initialization_provenance(initialization_source)
     metadata["arguments"] = vars(args).copy()
     if args.local_rank == 0:
         write_provenance(Path(args.log_dir) / "provenance.json", metadata)
@@ -808,6 +819,14 @@ def main(args):
         resume_contract = build_resume_contract(args, metadata, tokenizer, ds_config, world_size, model=model)
         if args.resume:
             resume_manifest = read_checkpoint_manifest(args.resume, resume_contract)
+        if args.initialize_from_crag:
+            from src.utils.crag_initialization import initialize_from_crag
+            metadata["initialization"] = initialize_from_crag(
+                model, args, tokenizer, resume_contract, source=initialization_source,
+            )
+            if args.local_rank == 0:
+                write_provenance(Path(args.log_dir) / "provenance.json", metadata)
+                logger.info("Initialized complete CRAG model weights for a fresh run: %s", metadata["initialization"])
 
     model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
         model=model,
@@ -827,6 +846,12 @@ def main(args):
     best_checkpoint = None
     history = []
     resume_verification = None
+    if args.initialize_from_crag:
+        if model_engine.global_steps != 0 or args.start_epoch != 0:
+            raise RuntimeError("CRAG initialization must create a new optimizer/scheduler at global step zero")
+        metadata["initialization"]["fresh_engine_global_steps_verified"] = int(model_engine.global_steps)
+        if args.local_rank == 0:
+            write_provenance(Path(args.log_dir) / "provenance.json", metadata)
     if args.resume:
         if args.local_rank == 0:
             logger.info(f"Loading checkpoint from {args.resume}")
@@ -1005,6 +1030,7 @@ def main(args):
                     "latest_checkpoint": str(Path(args.log_dir) / "last_model"),
                     "best_checkpoint": best_checkpoint, "best_iou": best_score,
                     "history": history, "resume_verification": resume_verification,
+                    "initialization": metadata.get("initialization"),
                 })
                 logger.info("Complete CRAG checkpoint saved at epoch %s; best aIoU %.6f; is_best=%s",
                             epoch + 1, best_score, is_best)

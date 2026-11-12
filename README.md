@@ -619,6 +619,34 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 "$PYTHON_BIN" tools/
 Python 语法、shell 语法和 diff 检查通过，GPU 0–1 已释放。本轮直接比较完成后停止，
 等待用户验收；未执行消融、其他划分训练或启动新的跟进自动化。
 
+### aIoU 自动优化：实验约定（2026-11-12，测量准备中）
+
+用户授权以前台 Codex Goal 执行可回退实验，目标是相同完整 PIADv1 Seen 测试协议下
+`aIoU >= 0.2154`（已测本地 HAMMER 为 `0.2153273158622429`）。
+实验分支为 `codex/crag-aiou-autoresearch`，隔离 worktree 位于本地主目录的
+`exp/crag_aiou_autoresearch`，不会移动、暂存或提交主目录未跟踪的 `CRAG3D.md`。
+控制入口为用户安装的 `codex-autoresearch/scripts/autoresearch.py`；启动后由其 `finish`
+统一提交、测量、保留或回退实验，不能手动修改控制历史来恢复或制造结果。
+
+每次测量都从阶段 5 的同一个 `global_step5292` CRAG 最佳原生模型初始化，**只加载模型**，
+新建 optimizer/scheduler，epoch 和 global step 从零开始；旧 checkpoint、完成合同和 RNG
+保持原样，不把不同源码/日程伪装成严格断点恢复。源词表、PartField、数据清单、LoRA 和
+模型形状必须匹配。固定微调 2 epochs × 196 steps，4 GPU（仅物理 0–3）、全局 batch 64、
+microbatch 2 × accumulation 8、BF16、seed 3407、LR `1e-5`，原损失权重和 100-step warmup
+不变。先以原 CF-only 采样完成相同预算对照，再验证混合采样修复；每次候选均重新从固定
+源权重出发，不沿用上个候选的微调结果。
+
+统一评测第 2 轮的 `last_model`，不从中间轮次按 test 分数选优；复用锁定的原指标和
+阶段 6 固定逐样本问答抽样，完整 1012 例，输出最终 aIoU 给控制脚本。指标和数据清单
+由固定 guard 检查，测量和 guard 不属于可变的实验源码范围。候选范围限于 CRAG 模型/
+损失、训练采样和初始化所需代码。目标达成或用户要求停止时结束；没有擅自设定实验轮数
+上限。仅训练初始化、隔离分支和测量工具的准备不等于模型已优于 HAMMER。
+
+本次短微调从已见过原训练标签的权重出发；不能把重新划出的训练开发集称为完全未见
+验证。原 1012 例 test 已用于历史选模和错误分析，并继续作为用户指定的开发验收指标，
+即使突破目标，也不能声称这是无偏的独立泛化结果。本轮不更改测试标签、清单或指标，
+不使用测试 GT 训练、不为 Display/Bag/Microwave/Chair 编写类别硬编码预测规则。
+
 ## :books: License
 This repository is released under the [MIT license](LICENSE).
 

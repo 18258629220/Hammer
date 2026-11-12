@@ -38,6 +38,13 @@ _CACHE_FIELDS = (
     "clustering_max_iter", "alignment_tolerance",
 )
 
+# These differences describe a new optimization run, not a training resume.
+# Architecture, losses, data/cache identities and vocabulary remain protected.
+_INITIALIZATION_ARGUMENT_CHANGES = frozenset({
+    "epochs", "steps_per_epoch", "batch_size", "grad_accumulation_steps",
+    "val_batch_size", "lr", "beta1", "beta2", "seed", "gradient_checkpointing",
+})
+
 
 def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -50,6 +57,55 @@ def _digest(value):
 
 def _json_copy(value):
     return json.loads(_canonical(value))
+
+
+def initialization_contract_changes(source, current):
+    """Validate weights-only initialization and return every permitted change.
+
+    This deliberately does not relax ``read_checkpoint_manifest`` or the full
+    resume path. Source and destination contracts remain separate immutable
+    records. A new schedule/optimizer/source/topology is allowed; model shape,
+    trainable flags, losses, LoRA semantics and input identities must agree.
+    """
+    source, current = _json_copy(source), _json_copy(current)
+    differences = []
+    for key in sorted(set(source) | set(current)):
+        first, second = source.get(key), current.get(key)
+        if first == second:
+            continue
+        if key == "arguments":
+            differences.extend(initialization_argument_changes(first, second))
+        elif key in {"source_sha256", "world_size", "deepspeed"}:
+            differences.append({"field": key, "source": first, "current": second})
+        else:
+            raise ValueError(f"CRAG weights-only initialization contract mismatch: {key}")
+    for contract in (source, current):
+        if contract.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("Unsupported CRAG initialization contract version")
+        if not contract.get("model_state_signature"):
+            raise ValueError("CRAG initialization requires a complete model shape/trainable signature")
+        config = contract.get("deepspeed", {})
+        if config.get("zero_optimization", {}).get("stage") != 2:
+            raise ValueError("CRAG initialization requires native ZeRO-2 contracts")
+        precision = ("bf16" if config.get("bf16", {}).get("enabled") else
+                     "fp16" if config.get("fp16", {}).get("enabled") else "fp32")
+        if precision != contract["arguments"]["precision"]:
+            raise ValueError("CRAG initialization precision and DeepSpeed config disagree")
+    return differences
+
+
+def initialization_argument_changes(source, current):
+    """Cheap argument-only check before creating any model or CUDA tensors."""
+    differences = []
+    for key in sorted(set(source) | set(current)):
+        first, second = source.get(key), current.get(key)
+        if first == second:
+            continue
+        if key not in _INITIALIZATION_ARGUMENT_CHANGES:
+            raise ValueError(f"CRAG weights-only initialization argument mismatch: {key}: "
+                             f"source={first!r}, current={second!r}")
+        differences.append({"field": "arguments." + key, "source": first, "current": second})
+    return differences
 
 
 def _tag_directory(save_dir, tag):

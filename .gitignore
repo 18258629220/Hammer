@@ -176,3 +176,6 @@ tmp
 *.pdf
 ckpt/
 ckpt
+
+# Codex autoresearch control history and logs are local artifacts.
+autoresearch-results/
