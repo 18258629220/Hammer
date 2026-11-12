@@ -44,6 +44,11 @@ class FunctionalGraph(nn.Module):
     parameters in BF16. Edge MLPs are checkpointed in training so their saved
     activations do not grow as ``E * full_feature_width``.
 
+    Point-level functional matching shares the coarse part encoder/projections
+    and uses each point's parent-part geometry. Its within-part centered logit
+    residual augments only y0; zero mean logits do not conserve probability
+    mass. The shared point-level gradients can also change the coarse matcher.
+
     ``edge_index`` is [B,2,E]. Its padded long-edge slots have ``edge_mask=False``
     and exactly zero weights. Local edges exclude the source itself. Long edges
     stay inside the source part, exceed its local kNN radius, and exclude all
@@ -222,8 +227,19 @@ class FunctionalGraph(nn.Module):
             point_parts = _gather(part_embeddings, part_ids)
             point_part_scores = _gather(part_scores, part_ids)
             broadcast = [role[:, None].expand(-1, count, -1) for role in (effect, contact, exclude)]
-            y0_logits = _mlp(self.initial_probability, torch.cat((point_features, *broadcast, point_parts,
-                                                                point_part_scores.unsqueeze(-1)), dim=-1))
+            base_y0_logits = _mlp(self.initial_probability, torch.cat((point_features, *broadcast, point_parts,
+                                                                     point_part_scores.unsqueeze(-1)), dim=-1))
+            # Keep the old coarse context/score inputs. Reuse their matching
+            # basis for point detail, retaining parent geometry rather than
+            # substituting singleton scale/count statistics into trained heads.
+            dense_embeddings = _mlp(self.part_encoder, torch.cat((point_features, _gather(part_geometry, part_ids)), dim=-1))
+            dense_positive = torch.einsum("bd,bnd->bn", effect, _linear(self.part_effect_projection, dense_embeddings)) / math.sqrt(self.embedding_dim)
+            dense_negative = torch.einsum("bd,bnd->bn", exclude, _linear(self.part_exclude_projection, dense_embeddings)) / math.sqrt(self.embedding_dim)
+            dense_logits = (dense_positive - alpha * dense_negative).unsqueeze(-1)
+            dense_part_mean = torch.zeros_like(part_logits).scatter_add(1, part_ids, dense_logits[..., 0])
+            dense_part_mean = dense_part_mean / encoded["counts"].float().clamp_min(1)
+            dense_residual = dense_logits - _gather(dense_part_mean, part_ids).unsqueeze(-1)
+            y0_logits = base_y0_logits + dense_residual
             y0 = torch.sigmoid(y0_logits)
             anchor_logits = _mlp(self.anchor_head, torch.cat((point_features, broadcast[0], point_part_scores.unsqueeze(-1)), dim=-1))
             anchor_confidence = .5 + torch.sigmoid(anchor_logits)
@@ -255,6 +271,8 @@ class FunctionalGraph(nn.Module):
             negative_weights = F.softplus(negative_logits) * edge_mask
         return {
             "y0": y0, "y0_logits": y0_logits, "anchor_confidence": anchor_confidence,
+            "base_y0_logits": base_y0_logits, "dense_point_logits": dense_logits,
+            "dense_logit_residual": dense_residual,
             "exclusion": exclusion, "exclusion_logits": exclusion_logits,
             "part_scores": part_scores, "part_logits": part_logits,
             "positive_part_logits": positive_part, "negative_part_logits": negative_part,
