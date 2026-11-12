@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .crag_checkpoint import (
-    initialization_argument_changes, initialization_contract_changes,
+    _ARGUMENTS, initialization_argument_changes, initialization_contract_changes,
 )
 from .evaluation_checkpoint import inspect_evaluation_checkpoint, _native_inventory
 from .role_tokens import tokenizer_record, validate_role_record
@@ -37,7 +37,10 @@ def prepare_crag_initialization(args):
     if source["format"] != "native_crag_zero2":
         raise ValueError("--initialize_from_crag requires a complete native CRAG checkpoint")
     saved = source["contract"]["arguments"]
-    current = {name: getattr(args, name) for name in saved}
+    # Include current-only training semantics (e.g. a sampler probability
+    # absent from older native contracts), so the fresh-run difference is
+    # explicit rather than silently inherited or omitted during preflight.
+    current = {name: getattr(args, name) for name in set(saved) | set(_ARGUMENTS)}
     current["lora_target_modules"] = sorted({
         name.strip() for name in args.lora_target_modules.split(",") if name.strip()
     })

@@ -30,7 +30,7 @@ _ARGUMENTS = (
     "ce_loss_weight", "mask_loss_weight", "role_loss_weight", "cf_loss_weight",
     "cf_overlap_threshold", "part_loss_weight", "graph_loss_weight",
     "aux_loss_weight", "graph_knn", "graph_long_range", "energy_steps",
-    "partfield_feature_dim",
+    "partfield_feature_dim", "cf_batch_probability",
 )
 _CACHE_FIELDS = (
     "version", "coordinate_system", "model_sha", "partfield_commit",
@@ -43,6 +43,7 @@ _CACHE_FIELDS = (
 _INITIALIZATION_ARGUMENT_CHANGES = frozenset({
     "epochs", "steps_per_epoch", "batch_size", "grad_accumulation_steps",
     "val_batch_size", "lr", "beta1", "beta2", "seed", "gradient_checkpointing",
+    "cf_batch_probability",
 })
 
 
@@ -64,8 +65,9 @@ def initialization_contract_changes(source, current):
 
     This deliberately does not relax ``read_checkpoint_manifest`` or the full
     resume path. Source and destination contracts remain separate immutable
-    records. A new schedule/optimizer/source/topology is allowed; model shape,
-    trainable flags, losses, LoRA semantics and input identities must agree.
+    records. A new schedule/optimizer/source/topology or explicit sampler
+    probability is allowed; model shape, trainable flags, losses, LoRA
+    semantics and input identities must agree.
     """
     source, current = _json_copy(source), _json_copy(current)
     differences = []
@@ -96,6 +98,12 @@ def initialization_contract_changes(source, current):
 
 def initialization_argument_changes(source, current):
     """Cheap argument-only check before creating any model or CUDA tensors."""
+    for arguments in (source, current):
+        if "cf_batch_probability" in arguments:
+            value = arguments["cf_batch_probability"]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or not 0 <= value <= 1):
+                raise ValueError("CRAG cf_batch_probability must be finite and in [0,1]")
     differences = []
     for key in sorted(set(source) | set(current)):
         first, second = source.get(key), current.get(key)

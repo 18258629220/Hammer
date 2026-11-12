@@ -2,6 +2,7 @@ import os
 import copy
 import random
 import hashlib
+import math
 from torch.utils.data import Dataset
 
 import numpy as np
@@ -89,6 +90,13 @@ def _role_metadata(cached, variant, raw_xyz, affordance, image):
     return cached
 
 
+def _validate_cf_batch_probability(value):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not 0 <= value <= 1):
+        raise ValueError("cf_batch_probability must be finite and in [0,1]")
+    return float(value)
+
+
 def _prepare_cf_pairs(dataset, dataset_name, index_path):
     dataset.cf_index_path = ""
     dataset.cf_pairs = []
@@ -114,6 +122,11 @@ def _sample_batch(dataset, indices):
         return [dataset[index] for index in indices]
     if len(indices) < 2 or len(indices) % 2:
         raise ValueError("Counterfactual sampling requires an even local batch size of at least two")
+    probability = getattr(dataset, "cf_batch_probability", 1.0)
+    # Mix complete ordinary batches with complete CF batches so single-task
+    # shapes remain trainable. Endpoints consume no extra routing RNG draw.
+    if probability == 0 or (probability < 1 and random.random() >= probability):
+        return [dataset[index] for index in indices]
     samples = []
     for _ in range(len(indices) // 2):
         pair = random.choice(dataset.cf_pairs)
@@ -366,8 +379,10 @@ class PIADAfford(Dataset):
         model_variant='hammer',
         partfield_cache_dir='',
         cf_index_path='',
+        cf_batch_probability=0.5,
     ):
         super().__init__()
+        self.cf_batch_probability = _validate_cf_batch_probability(cf_batch_probability)
         self.samples_per_epoch = samples_per_epoch
         self.data_root = data_root
         self.split = split
@@ -524,8 +539,10 @@ class PIADv1Afford(Dataset):
         model_variant='hammer',
         partfield_cache_dir='',
         cf_index_path='',
+        cf_batch_probability=0.5,
     ):
         super().__init__()
+        self.cf_batch_probability = _validate_cf_batch_probability(cf_batch_probability)
         self.samples_per_epoch = samples_per_epoch
         self.data_root = data_root
         self.split = split
