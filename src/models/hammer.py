@@ -443,13 +443,11 @@ class Hammer(nn.Module):
             result["aux_loss"] = aux_loss
             result["iou_loss"] = iou_loss
             result["aux_iou_loss"] = aux_iou_loss
-            # Emphasize foreground overlap at both outputs while retaining
-            # the existing soft-heatmap CA supervision.
             result["loss"] = (result["loss"] + self.part_loss_weight * graph_losses["part_loss"]
                               + self.graph_loss_weight * graph_losses["graph_loss"]
                               + self.aux_loss_weight * aux_loss
-                              + 2 * self.mask_loss_weight * iou_loss
-                              + 2 * self.aux_loss_weight * aux_iou_loss)
+                              + self.mask_loss_weight * iou_loss
+                              + self.aux_loss_weight * aux_iou_loss)
             result.update(
                 y0=graph["y0"], y_final=pred_afford, part_scores=graph["part_scores"],
                 energy_history=decoded["energy_history"],
