@@ -45,9 +45,9 @@ class FunctionalGraph(nn.Module):
     activations do not grow as ``E * full_feature_width``.
 
     Point-level functional matching shares the coarse part encoder/projections
-    and uses each point's parent-part geometry. Its centered residual augments
-    y0 directly. A second local contrast reads the normalized EXCLUDE/point
-    match supervised by CRIM, with the same temperature. This contrast refines
+    and uses each point's parent-part geometry. Its centered residual and the
+    normalized EXCLUDE/point contrast supervised by CRIM both augment y0
+    logits directly. The CRIM contrast uses the shared temperature and refines
     the coarse part prior into point scores for seed, anchor and affinity
     heads. Coarse embedding context is retained. Zero mean logits do not
     conserve probability mass, and shared gradients can change coarse matching.
@@ -252,7 +252,8 @@ class FunctionalGraph(nn.Module):
             base_y0_logits = _mlp(self.initial_probability, torch.cat((
                 point_features, *broadcast, point_parts, dense_point_scores
             ), dim=-1))
-            y0_logits = base_y0_logits + dense_residual
+            # Add the supervised local contrast before the seed sigmoid.
+            y0_logits = base_y0_logits + dense_residual + role_logit_residual
             y0 = torch.sigmoid(y0_logits)
             point_part_scores = dense_point_scores[..., 0]
             anchor_logits = _mlp(self.anchor_head, torch.cat((point_features, broadcast[0], point_part_scores.unsqueeze(-1)), dim=-1))
