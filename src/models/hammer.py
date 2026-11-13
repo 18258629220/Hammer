@@ -416,7 +416,10 @@ class Hammer(nn.Module):
         roles = role_output["roles"]
         graph = decoded = None
         if self.model_variant == "crag3d":
-            graph = self.functional_graph(points, features, part_ids, encoded, roles)
+            graph = self.functional_graph(
+                points, features, part_ids, encoded, roles,
+                role_temperature=self.crim_losses.temperature,
+            )
             decoded = self.energy_decoder(
                 graph["y0"], graph["edge_index"], graph["positive_weights"],
                 graph["negative_weights"], graph["anchor_confidence"], graph["exclusion"],

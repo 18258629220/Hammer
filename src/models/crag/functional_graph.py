@@ -45,9 +45,12 @@ class FunctionalGraph(nn.Module):
     activations do not grow as ``E * full_feature_width``.
 
     Point-level functional matching shares the coarse part encoder/projections
-    and uses each point's parent-part geometry. Its within-part centered logit
-    residual augments only y0; zero mean logits do not conserve probability
-    mass. The shared point-level gradients can also change the coarse matcher.
+    and uses each point's parent-part geometry. Its centered residual augments
+    y0 directly. A second local contrast reads the normalized EXCLUDE/point
+    match supervised by CRIM, with the same temperature. This contrast refines
+    the coarse part prior into point scores for seed, anchor and affinity
+    heads. Coarse embedding context is retained. Zero mean logits do not
+    conserve probability mass, and shared gradients can change coarse matching.
 
     ``edge_index`` is [B,2,E]. Its padded long-edge slots have ``edge_mask=False``
     and exactly zero weights. Local edges exclude the source itself. Long edges
@@ -203,7 +206,9 @@ class FunctionalGraph(nn.Module):
             similarity = (_gather(raw_pf, source) * _gather(raw_pf, destination)).sum(-1)
         return positive, negative, distance, similarity
 
-    def forward(self, points, features, part_ids, encoded, roles):
+    def forward(self, points, features, part_ids, encoded, roles, role_temperature=.1):
+        if isinstance(role_temperature, bool) or not math.isfinite(role_temperature) or role_temperature <= 0:
+            raise ValueError("Role matching temperature must be finite and positive")
         self._validate(points, features, part_ids, encoded, roles)
         batch_size, _, count = points.shape
         with torch.autocast(device_type=points.device.type, enabled=False):
@@ -225,13 +230,9 @@ class FunctionalGraph(nn.Module):
             part_logits = positive_part - alpha * negative_part
             part_scores = torch.sigmoid(part_logits) * encoded["part_mask"]
             point_parts = _gather(part_embeddings, part_ids)
-            point_part_scores = _gather(part_scores, part_ids)
             broadcast = [role[:, None].expand(-1, count, -1) for role in (effect, contact, exclude)]
-            base_y0_logits = _mlp(self.initial_probability, torch.cat((point_features, *broadcast, point_parts,
-                                                                     point_part_scores.unsqueeze(-1)), dim=-1))
-            # Keep the old coarse context/score inputs. Reuse their matching
-            # basis for point detail, retaining parent geometry rather than
-            # substituting singleton scale/count statistics into trained heads.
+            # Reuse the coarse matching basis for local evidence, retaining
+            # parent geometry instead of singleton scale/count statistics.
             dense_embeddings = _mlp(self.part_encoder, torch.cat((point_features, _gather(part_geometry, part_ids)), dim=-1))
             dense_positive = torch.einsum("bd,bnd->bn", effect, _linear(self.part_effect_projection, dense_embeddings)) / math.sqrt(self.embedding_dim)
             dense_negative = torch.einsum("bd,bnd->bn", exclude, _linear(self.part_exclude_projection, dense_embeddings)) / math.sqrt(self.embedding_dim)
@@ -239,8 +240,21 @@ class FunctionalGraph(nn.Module):
             dense_part_mean = torch.zeros_like(part_logits).scatter_add(1, part_ids, dense_logits[..., 0])
             dense_part_mean = dense_part_mean / encoded["counts"].float().clamp_min(1)
             dense_residual = dense_logits - _gather(dense_part_mean, part_ids).unsqueeze(-1)
+            # CRIM trains this cosine match against the soft background target.
+            # Center its inverse locally while retaining the coarse part prior.
+            point_exclusion_prior_logits = torch.einsum(
+                "bd,bnd->bn", F.normalize(exclude, dim=-1), F.normalize(point_features, dim=-1)
+            ).unsqueeze(-1) / role_temperature
+            role_part_mean = torch.zeros_like(part_logits).scatter_add(1, part_ids, point_exclusion_prior_logits[..., 0])
+            role_part_mean = role_part_mean / encoded["counts"].float().clamp_min(1)
+            role_logit_residual = _gather(role_part_mean, part_ids).unsqueeze(-1) - point_exclusion_prior_logits
+            dense_point_scores = torch.sigmoid(_gather(part_logits, part_ids).unsqueeze(-1) + role_logit_residual)
+            base_y0_logits = _mlp(self.initial_probability, torch.cat((
+                point_features, *broadcast, point_parts, dense_point_scores
+            ), dim=-1))
             y0_logits = base_y0_logits + dense_residual
             y0 = torch.sigmoid(y0_logits)
+            point_part_scores = dense_point_scores[..., 0]
             anchor_logits = _mlp(self.anchor_head, torch.cat((point_features, broadcast[0], point_part_scores.unsqueeze(-1)), dim=-1))
             anchor_confidence = .5 + torch.sigmoid(anchor_logits)
             exclusion_logits = _mlp(self.exclusion_head, torch.cat((point_features, broadcast[2]), dim=-1))
@@ -273,6 +287,9 @@ class FunctionalGraph(nn.Module):
             "y0": y0, "y0_logits": y0_logits, "anchor_confidence": anchor_confidence,
             "base_y0_logits": base_y0_logits, "dense_point_logits": dense_logits,
             "dense_logit_residual": dense_residual,
+            "dense_point_scores": dense_point_scores,
+            "point_exclusion_prior_logits": point_exclusion_prior_logits,
+            "role_logit_residual": role_logit_residual,
             "exclusion": exclusion, "exclusion_logits": exclusion_logits,
             "part_scores": part_scores, "part_logits": part_logits,
             "positive_part_logits": positive_part, "negative_part_logits": negative_part,
