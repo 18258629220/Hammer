@@ -23,6 +23,7 @@ from src.models.crag.counterfactual import counterfactual_loss
 from src.models.crag.functional_graph import FunctionalGraph
 from src.models.crag.energy_decoder import EnergyDecoder
 from src.models.crag.functional_losses import FunctionalGraphLoss, foreground_iou_loss
+from src.models.crag.soft_fidelity import soft_heatmap_fidelity_terms
     
 
 class SwapAxes(nn.Module):
@@ -451,6 +452,19 @@ class Hammer(nn.Module):
                               + self.aux_loss_weight * aux_loss
                               + self.mask_loss_weight * iou_loss
                               + self.aux_loss_weight * aux_iou_loss)
+            if self.training and not inference:
+                fidelity = soft_heatmap_fidelity_terms(
+                    graph["y0_logits"], pred_afford, gt_affords
+                )
+                fidelity_loss = (fidelity["final_mae"] + .25 * fidelity["seed_mae"]
+                                 + .1 * fidelity["seed_distribution_tv"])
+                result.update(
+                    soft_final_mae=fidelity["final_mae"],
+                    soft_seed_mae=fidelity["seed_mae"],
+                    soft_seed_tv=fidelity["seed_distribution_tv"],
+                    soft_fidelity_loss=fidelity_loss,
+                )
+                result["loss"] = result["loss"] + fidelity_loss
             result.update(
                 y0=graph["y0"], y_final=pred_afford, part_scores=graph["part_scores"],
                 energy_history=decoded["energy_history"],
