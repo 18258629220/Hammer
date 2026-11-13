@@ -49,6 +49,12 @@ class FunctionalGraph(nn.Module):
     residual augments only y0; zero mean logits do not conserve probability
     mass. The shared point-level gradients can also change the coarse matcher.
 
+    A second evaluation of the same y0 MLP uses centered dense embeddings in
+    its context channel. Centering its response relative to the base MLP is
+    equivalent to mean_part(z_base) + center_part(z_dense) + the scalar role
+    residual: common and local logit modes are recombined, with changed shared
+    gradients and no guarantee of probability-mass or accuracy preservation.
+
     ``edge_index`` is [B,2,E]. Its padded long-edge slots have ``edge_mask=False``
     and exactly zero weights. Local edges exclude the source itself. Long edges
     stay inside the source part, exceed its local kNN radius, and exclude all
@@ -239,7 +245,19 @@ class FunctionalGraph(nn.Module):
             dense_part_mean = torch.zeros_like(part_logits).scatter_add(1, part_ids, dense_logits[..., 0])
             dense_part_mean = dense_part_mean / encoded["counts"].float().clamp_min(1)
             dense_residual = dense_logits - _gather(dense_part_mean, part_ids).unsqueeze(-1)
-            y0_logits = base_y0_logits + dense_residual
+            dense_embedding_mean = torch.zeros_like(part_embeddings).scatter_add(
+                1, part_ids.unsqueeze(-1).expand(-1, -1, self.embedding_dim), dense_embeddings
+            )
+            dense_embedding_mean = dense_embedding_mean / encoded["counts"].float().clamp_min(1).unsqueeze(-1)
+            dense_embedding_residual = dense_embeddings - _gather(dense_embedding_mean, part_ids)
+            dense_context_y0_logits = _mlp(self.initial_probability, torch.cat((
+                point_features, *broadcast, point_parts + dense_embedding_residual, point_part_scores.unsqueeze(-1)
+            ), dim=-1))
+            mlp_response = dense_context_y0_logits - base_y0_logits
+            response_mean = torch.zeros_like(part_logits).scatter_add(1, part_ids, mlp_response[..., 0])
+            response_mean = response_mean / encoded["counts"].float().clamp_min(1)
+            centered_mlp_response = mlp_response - _gather(response_mean, part_ids).unsqueeze(-1)
+            y0_logits = base_y0_logits + dense_residual + centered_mlp_response
             y0 = torch.sigmoid(y0_logits)
             anchor_logits = _mlp(self.anchor_head, torch.cat((point_features, broadcast[0], point_part_scores.unsqueeze(-1)), dim=-1))
             anchor_confidence = .5 + torch.sigmoid(anchor_logits)
@@ -273,6 +291,7 @@ class FunctionalGraph(nn.Module):
             "y0": y0, "y0_logits": y0_logits, "anchor_confidence": anchor_confidence,
             "base_y0_logits": base_y0_logits, "dense_point_logits": dense_logits,
             "dense_logit_residual": dense_residual,
+            "dense_context_y0_logits": dense_context_y0_logits, "centered_mlp_response": centered_mlp_response,
             "exclusion": exclusion, "exclusion_logits": exclusion_logits,
             "part_scores": part_scores, "part_logits": part_logits,
             "positive_part_logits": positive_part, "negative_part_logits": negative_part,
