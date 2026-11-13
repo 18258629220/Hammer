@@ -12,7 +12,6 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .partfield_adapter import _farthest_indices
-from .part_mean_logits import constrain_part_mean_logits
 
 
 def _linear(layer, values):
@@ -50,11 +49,8 @@ class FunctionalGraph(nn.Module):
     y0 directly. A second local contrast reads the normalized EXCLUDE/point
     match supervised by CRIM, with the same temperature. This contrast refines
     the coarse part prior into point scores for seed, anchor and affinity
-    heads. Coarse embedding context is retained. A parameter-free common logit
-    offset then constrains each part's mean seed probability to its supervised
-    coarse score, while preserving within-part local ordering. This constraint
-    does not conserve final decoder mass or guarantee calibrated probabilities,
-    and shared gradients can change coarse matching.
+    heads. Coarse embedding context is retained. Zero mean logits do not
+    conserve probability mass, and shared gradients can change coarse matching.
 
     ``edge_index`` is [B,2,E]. Its padded long-edge slots have ``edge_mask=False``
     and exactly zero weights. Local edges exclude the source itself. Long edges
@@ -256,9 +252,7 @@ class FunctionalGraph(nn.Module):
             base_y0_logits = _mlp(self.initial_probability, torch.cat((
                 point_features, *broadcast, point_parts, dense_point_scores
             ), dim=-1))
-            y0_logits = constrain_part_mean_logits(
-                (base_y0_logits + dense_residual)[..., 0], part_logits, part_ids
-            ).unsqueeze(-1)
+            y0_logits = base_y0_logits + dense_residual
             y0 = torch.sigmoid(y0_logits)
             point_part_scores = dense_point_scores[..., 0]
             anchor_logits = _mlp(self.anchor_head, torch.cat((point_features, broadcast[0], point_part_scores.unsqueeze(-1)), dim=-1))
