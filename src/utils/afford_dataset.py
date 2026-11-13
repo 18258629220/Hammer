@@ -379,7 +379,7 @@ class PIADAfford(Dataset):
         model_variant='hammer',
         partfield_cache_dir='',
         cf_index_path='',
-        cf_batch_probability=0.5,
+        cf_batch_probability=0.125,
     ):
         super().__init__()
         self.cf_batch_probability = _validate_cf_batch_probability(cf_batch_probability)
@@ -539,7 +539,7 @@ class PIADv1Afford(Dataset):
         model_variant='hammer',
         partfield_cache_dir='',
         cf_index_path='',
-        cf_batch_probability=0.5,
+        cf_batch_probability=0.125,
     ):
         super().__init__()
         self.cf_batch_probability = _validate_cf_batch_probability(cf_batch_probability)

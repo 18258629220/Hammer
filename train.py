@@ -84,7 +84,7 @@ def parse_args(args):
     parser.add_argument("--energy_steps", default=5, type=int)
     parser.add_argument("--cf_index_path", default="", type=str)
     parser.add_argument("--cf_overlap_threshold", default=0.7, type=float)
-    parser.add_argument("--cf_batch_probability", default=0.5, type=float,
+    parser.add_argument("--cf_batch_probability", default=0.125, type=float,
                         help="Probability of a train-only counterfactual pair batch; otherwise use ordinary PIAD sampling")
     parser.add_argument("--processor_dir", default="", type=str, help="Saved CRIM processor/tokenizer directory")
     parser.add_argument("--smoke_optimizer_steps", default=3, type=int, help="Bounded CRIM smoke updates using the original trainer and accumulation")
