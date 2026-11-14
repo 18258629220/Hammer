@@ -24,7 +24,7 @@ from src.models.crag.functional_graph import FunctionalGraph
 from src.models.crag.energy_decoder import EnergyDecoder
 from src.models.crag.functional_losses import FunctionalGraphLoss, foreground_iou_loss
 from src.models.crag.soft_fidelity import soft_heatmap_fidelity_terms
-from src.models.crag.global_order import global_soft_order_terms
+from src.models.crag.sparse_order import sparse_soft_order_terms
     
 
 class SwapAxes(nn.Module):
@@ -466,13 +466,14 @@ class Hammer(nn.Module):
                     soft_fidelity_loss=fidelity_loss,
                 )
                 result["loss"] = result["loss"] + fidelity_loss
-                ordering = global_soft_order_terms(graph["y0_logits"], gt_affords)
-                ordering_loss = ordering["loss"].to(graph["y0_logits"].dtype)
-                result.update(
-                    seed_global_order_loss=ordering_loss,
-                    seed_global_order_pairs=ordering["valid_pairs_per_shape"].sum(),
+                ordering = sparse_soft_order_terms(
+                    graph["y0_logits"], gt_affords, graph["edge_index"], graph["edge_mask"]
                 )
-                result["loss"] = result["loss"] + .1 * ordering_loss
+                result.update(
+                    seed_sparse_order_loss=ordering["loss"],
+                    seed_sparse_order_edges=ordering["valid_edges_per_shape"].sum(),
+                )
+                result["loss"] = result["loss"] + .1 * ordering["loss"]
             result.update(
                 y0=graph["y0"], y_final=pred_afford, part_scores=graph["part_scores"],
                 energy_history=decoded["energy_history"],
