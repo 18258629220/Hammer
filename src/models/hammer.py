@@ -458,7 +458,7 @@ class Hammer(nn.Module):
                     graph["y0_logits"], pred_afford, gt_affords
                 )
                 fidelity_loss = (fidelity["final_mae"] + .25 * fidelity["seed_mae"]
-                                 + .5 * fidelity["seed_distribution_tv"])
+                                 + .1 * fidelity["seed_distribution_tv"])
                 result.update(
                     soft_final_mae=fidelity["final_mae"],
                     soft_seed_mae=fidelity["seed_mae"],
